@@ -48,7 +48,7 @@ TerminalPhone is a single, self-contained Bash script that provides anonymous, e
 
 ``` bash
 
-git clone <repository-url>
+git clone <https://github.com/terminalphone/terminalphone.git>
 cd terminalphone
 bash terminalphone.sh
 
@@ -92,7 +92,7 @@ This installs the command-line utilities that communicate with the Termux:API ap
 **Step 4: Run TerminalPhone**
 
 ```bash
-git clone <https://gitlab.com/here_forawhile/terminalphone.git>
+git clone <repository-url>
 cd terminalphone
 bash terminalphone.sh
 ```
@@ -181,36 +181,21 @@ bash terminalphone.sh call ADDRESS  # Call a .onion address
 TerminalPhone uses a record-then-send model. When you activate PTT, the microphone records continuously until you release. The complete recording is then processed through the following pipeline:
 
 ```
-Sender                                      Receiver
-------                                      --------
-Microphone
-  |
-  v
-Raw PCM (8kHz, 16-bit, mono)
-  |
-  v
-Opus encode (16kbps, 60ms frames)
-  |
-  v
-AES-256-CBC encrypt (PBKDF2, shared secret)
-  |
-  v
-Base64 encode
-  |
-  v
-socat --> Tor circuit --> .onion --> socat
-                                      |
-                                      v
-                                Base64 decode
-                                      |
-                                      v
-                                AES-256-CBC decrypt
-                                      |
-                                      v
-                                Opus decode
-                                      |
-                                      v
-                                Speaker / Media Player
+SENDER                                          RECEIVER
+──────                                          ────────
+Microphone                                      Speaker
+    │                                               ▲
+    ▼                                               │
+Raw PCM (8kHz, 16-bit, mono)                    Opus decode
+    │                                               ▲
+    ▼                                               │
+Opus encode (16kbps)                            AES-256-CBC decrypt
+    │                                               ▲
+    ▼                                               │
+AES-256-CBC encrypt                             Base64 decode
+    │                                               ▲
+    ▼                                               │
+Base64 encode ──▶ socat ──▶ Tor ──▶ socat ──▶ Receive
 ```
 
 The wire protocol is line-based text over a TCP connection:
