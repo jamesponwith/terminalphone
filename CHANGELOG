@@ -15,3 +15,7 @@ Red indicator dot if ciphers are mismathed.
 
 Included the abilty to change opus encoding and cipher configuration with a [S] hotkey while in a call.
 
+Version 1.0.2 2-18-26
+
+Remove old unused text protocal code. 
+
