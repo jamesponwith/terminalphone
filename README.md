@@ -31,8 +31,11 @@ TerminalPhone is a single, self-contained Bash script that provides anonymous, e
 - **In-Call Encrypted Chat** -- Send and receive encrypted text messages during a call. Press `T` to type a message.
 - **Caller ID** -- Both parties automatically exchange `.onion` addresses on connect. The remote address is displayed in the call header.
 - **Auto-Hangup Detection** -- When one party hangs up, the other is notified immediately and the call ends automatically.
+- **Configurable Cipher** -- Choose from 21 curated ciphers ranked by strength (256-bit → 128-bit). Includes AES, ChaCha20, Camellia, and ARIA families. Weak ciphers (DES, RC4, ECB modes) are excluded.
+- **Live Cipher Negotiation** -- Both parties exchange cipher information on connect. The call header shows both local and remote ciphers with green (match) or red (mismatch) indicators, updated in real time.
+- **Mid-Call Settings** -- Press `S` during a call to access settings. Change your cipher on the fly; the remote party's display updates automatically.
 - **Tor Hidden Service** -- Each instance runs its own Tor hidden service. Your `.onion` address serves as a permanent, routable endpoint. No port forwarding or public IP required.
-- **End-to-End Encryption** -- All audio and text is encrypted with AES-256-CBC using PBKDF2 key derivation from a pre-shared secret before entering the Tor network.
+- **End-to-End Encryption** -- All audio and text is encrypted using a configurable cipher (default: AES-256-CBC) with PBKDF2 key derivation from a pre-shared secret before entering the Tor network.
 - **Low Bandwidth** -- Opus codec at 16kbps, 8kHz mono. A typical 10-second voice message is under 20KB, well within Tor's capacity.
 - **Cross-Platform** -- Runs on standard Linux distributions and Android via Termux. Platform-specific audio backends are handled transparently.
 - **No Root Required** -- PTT input uses terminal raw mode. No special permissions or kernel modules needed.
@@ -141,6 +144,7 @@ Both parties must have Tor running and the same shared secret configured before 
  9  Stop Tor                  Stop the Tor process
 10  Restart Tor               Stop and restart Tor
 11  Rotate onion address      Generate a new .onion address (destroys the old one)
+12  Settings                  Configure cipher and Opus quality
  0  Quit                      Stop Tor and exit
 ```
 
@@ -152,6 +156,7 @@ Both parties must have Tor running and the same shared secret configured before 
 |---|---|
 | Hold SPACE | Record voice message. Sends automatically on release. |
 | T | Send an encrypted text message. |
+| S | Open settings mid-call (change cipher, adjust quality). |
 | Q | Hang up and return to the menu. |
 
 **Termux (toggle mode):**
@@ -162,6 +167,7 @@ Android's software keyboard sends key events on release, not on press. TerminalP
 |---|---|
 | Tap SPACE | Start recording. Tap again to stop and send. |
 | T | Send an encrypted text message. |
+| S | Open settings mid-call (change cipher, adjust quality). |
 | Q | Hang up and return to the menu. |
 
 ### CLI Mode
@@ -203,6 +209,7 @@ The wire protocol is line-based text over a TCP connection:
 | Message | Description |
 |---|---|
 | `ID:<onion>` | Caller ID -- sender's `.onion` address |
+| `CIPHER:<name>` | Sender's encryption cipher. Exchanged on connect and on change. |
 | `PTT_START` | Sender has begun recording |
 | `PTT_STOP` | Sender has finished; audio follows or has been sent |
 | `AUDIO:<base64>` | Complete encrypted audio message |
@@ -216,7 +223,9 @@ On Termux, an additional conversion step handles Android's native M4A recording 
 
 ## Security Model
 
-**Encryption:** All audio is encrypted with AES-256-CBC before transmission. The key is derived from a pre-shared secret using PBKDF2 with 10,000 iterations. The encryption is applied at the application layer, independent of Tor's transport encryption.
+**Encryption:** All audio is encrypted with a user-configurable cipher (default: AES-256-CBC) before transmission. 21 curated ciphers are available, ranked from strongest (256-bit) to adequate (128-bit). The key is derived from a pre-shared secret using PBKDF2 with 10,000 iterations. The encryption is applied at the application layer, independent of Tor's transport encryption.
+
+**Cipher negotiation:** Both parties exchange cipher names on connect and whenever a cipher is changed mid-call. Cipher names are not secret (Kerckhoffs's principle). If the local and remote ciphers do not match, both parties see red indicators in the call header.
 
 **Transport:** All data is routed through Tor hidden service circuits. Neither party's IP address is exposed. There is no clearnet traffic. The connection cannot be attributed to either party by a network observer.
 
@@ -252,6 +261,7 @@ Default audio parameters (defined at the top of the script):
 | `LISTEN_PORT` | 7777 | TCP port for incoming connections |
 | `TOR_SOCKS_PORT` | 9050 | Tor SOCKS proxy port |
 | `OPUS_BITRATE` | 16 | Opus encoding bitrate in kbps |
+| `CIPHER` | aes-256-cbc | Encryption cipher (configurable via Settings) |
 | `SAMPLE_RATE` | 8000 | Audio sample rate in Hz |
 | `CHUNK_DURATION` | 1 | Duration for audio test chunks in seconds |
 
@@ -275,7 +285,9 @@ Confirm that both parties are using the same shared secret. Mismatched secrets w
 If the script hangs after pressing Q, press Ctrl+C to force cleanup and return to the shell.
 
 ---
-[MIRROR](https://bin.disroot.org/?e1356291b098cb75#FMQ4gxFwgdr3rjR1dpGS2csLmDPzDEkQW16fQ5P2Vt4y)
+[MIRROR V1.0.0]https://bin.disroot.org/?e1356291b098cb75#FMQ4gxFwgdr3rjR1dpGS2csLmDPzDEkQW16fQ5P2Vt4y)
+
+[MIRROR V1.0.1](https://bin.disroot.org/?d3bc0b8976113f58#AuUm4ev4vfeVmPyrh2KjAdhDP6WN4UX6yKQh9ERGD5Qt)
 ---
 
 ## License
