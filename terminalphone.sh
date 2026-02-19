@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION
 #=============================================================================
 APP_NAME="TerminalPhone"
-VERSION="1.0.4"
+VERSION="1.0.5"
 BASE_DIR="$(dirname "$(readlink -f "$0")")"
 DATA_DIR="$BASE_DIR/.terminalphone"
 TOR_DIR="$DATA_DIR/tor_data"
@@ -653,8 +653,9 @@ cleanup_call() {
     ORIGINAL_STTY=""
 
     # Close pipe file descriptors to unblock any blocking reads
-    exec 3<&- 2>/dev/null || true
-    exec 4>&- 2>/dev/null || true
+    # NOTE: must use { } group so 2>/dev/null doesn't permanently redirect stderr
+    { exec 3<&-; } 2>/dev/null || true
+    { exec 4>&-; } 2>/dev/null || true
 
     # Kill all call-related processes by PID files
     for pidfile in "$PID_DIR"/socat.pid "$PID_DIR"/socat_call.pid "$PID_DIR"/recv_loop.pid; do
