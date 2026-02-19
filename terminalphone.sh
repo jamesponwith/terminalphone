@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION
 #=============================================================================
 APP_NAME="TerminalPhone"
-VERSION="1.0.5"
+VERSION="1.0.6"
 BASE_DIR="$(dirname "$(readlink -f "$0")")"
 DATA_DIR="$BASE_DIR/.terminalphone"
 TOR_DIR="$DATA_DIR/tor_data"
@@ -24,6 +24,8 @@ CONNECTED_FLAG="$DATA_DIR/run/connected_$$"
 RECV_PIPE="$DATA_DIR/run/recv_$$"
 SEND_PIPE="$DATA_DIR/run/send_$$"
 CIPHER_RUNTIME_FILE="$DATA_DIR/run/cipher_$$"
+AUTO_LISTEN_FLAG="$DATA_DIR/run/autolisten_$$"
+AUTO_LISTEN_PID=""
 
 
 # Defaults
@@ -36,6 +38,7 @@ PTT_KEY=" "           # spacebar
 CHUNK_DURATION=1      # seconds per audio chunk
 CIPHER="aes-256-cbc"  # OpenSSL cipher for encryption
 SNOWFLAKE_ENABLED=0   # Snowflake bridge (off by default)
+AUTO_LISTEN=0         # Auto-listen after Tor starts (off by default)
 
 # ANSI Colors
 RED='\033[0;31m'
@@ -160,6 +163,7 @@ OPUS_FRAMESIZE=$OPUS_FRAMESIZE
 PTT_KEY="$PTT_KEY"
 CIPHER="$CIPHER"
 SNOWFLAKE_ENABLED=$SNOWFLAKE_ENABLED
+AUTO_LISTEN=$AUTO_LISTEN
 EOF
 }
 
@@ -419,13 +423,15 @@ start_tor() {
 }
 
 stop_tor() {
+    stop_auto_listener
     if [ -n "$TOR_PID" ] && kill -0 "$TOR_PID" 2>/dev/null; then
         kill "$TOR_PID" 2>/dev/null || true
         wait "$TOR_PID" 2>/dev/null || true
         TOR_PID=""
         log_ok "Tor stopped"
+    else
+        log_info "Tor is not running"
     fi
-
 }
 
 get_onion() {
@@ -581,7 +587,6 @@ stop_and_send() {
 
     # Encode → encrypt → send
     if [ -s "$raw_file" ]; then
-        echo -ne "\r  ${DIM}Sending...${NC}                                     " >&2
         opusenc --raw --raw-rate "$SAMPLE_RATE" --raw-chan 1 \
             --bitrate "$OPUS_BITRATE" --framesize "$OPUS_FRAMESIZE" \
             --speech --quiet \
@@ -590,9 +595,16 @@ stop_and_send() {
         if [ -s "$opus_file" ]; then
             encrypt_file "$opus_file" "$enc_file" 2>/dev/null
             if [ -s "$enc_file" ]; then
+                local enc_size
+                enc_size=$(stat -c%s "$enc_file" 2>/dev/null || echo 0)
+                local size_kb=$(( enc_size * 10 / 1024 ))
+                local size_whole=$(( size_kb / 10 ))
+                local size_frac=$(( size_kb % 10 ))
+
                 local b64
                 b64=$(base64 -w 0 "$enc_file" 2>/dev/null)
                 echo "AUDIO:${b64}" >&4 2>/dev/null || true
+                LAST_SENT_INFO="${size_whole}.${size_frac}KB"
             fi
         fi
     fi
@@ -695,8 +707,55 @@ cleanup_call() {
     CALL_ACTIVE=0
     REC_PID=""
 }
+#=============================================================================
+# AUTO-LISTEN (BACKGROUND LISTENER)
+#=============================================================================
 
-# Start listening for incoming calls
+start_auto_listener() {
+    # Only start if auto-listen is enabled and Tor is running
+    if [ "$AUTO_LISTEN" -ne 1 ]; then return 0; fi
+    if [ -z "$SHARED_SECRET" ]; then return 0; fi
+    if [ -z "$TOR_PID" ] || ! kill -0 "$TOR_PID" 2>/dev/null; then return 0; fi
+
+    # Stop any existing listener first
+    stop_auto_listener
+
+    mkdir -p "$AUDIO_DIR" "$DATA_DIR/run"
+    rm -f "$RECV_PIPE" "$SEND_PIPE" "$AUTO_LISTEN_FLAG"
+    mkfifo "$RECV_PIPE" "$SEND_PIPE"
+
+    socat "TCP-LISTEN:$LISTEN_PORT,reuseaddr" \
+        "SYSTEM:touch $AUTO_LISTEN_FLAG; cat $SEND_PIPE & cat > $RECV_PIPE" &
+    AUTO_LISTEN_PID=$!
+    save_pid "socat" "$AUTO_LISTEN_PID"
+}
+
+stop_auto_listener() {
+    if [ -n "$AUTO_LISTEN_PID" ]; then
+        kill "$AUTO_LISTEN_PID" 2>/dev/null || true
+        kill -9 "$AUTO_LISTEN_PID" 2>/dev/null || true
+        AUTO_LISTEN_PID=""
+    fi
+    rm -f "$AUTO_LISTEN_FLAG" "$RECV_PIPE" "$SEND_PIPE"
+}
+
+# Check if an incoming call arrived on the background listener
+check_auto_listen() {
+    if [ -f "$AUTO_LISTEN_FLAG" ]; then
+        rm -f "$AUTO_LISTEN_FLAG"
+        touch "$CONNECTED_FLAG"
+        echo -e "\n  ${GREEN}${BOLD}Incoming call detected!${NC}" >&2
+        sleep 0.5
+        in_call_session "$RECV_PIPE" "$SEND_PIPE" ""
+        cleanup_call
+        # Restart listener for next call
+        start_auto_listener
+        return 0
+    fi
+    return 1
+}
+
+# Start listening for incoming calls (manual, blocking)
 listen_for_call() {
     if [ -z "$SHARED_SECRET" ]; then
         log_err "No shared secret set! Use option 4 first."
@@ -704,6 +763,9 @@ listen_for_call() {
     fi
 
     start_tor || return 1
+
+    # Stop auto-listener if running (we'll do manual listen)
+    stop_auto_listener
 
     local onion
     onion=$(get_onion)
@@ -714,29 +776,25 @@ listen_for_call() {
     echo -e "  ${DIM}Press Ctrl+C to stop listening.${NC}\n"
 
     mkdir -p "$AUDIO_DIR"
-
-    # Use socat to accept a TCP connection, then handle it
     log_info "Waiting for incoming connection..."
 
-    # Create named pipes for bidirectional communication
     rm -f "$RECV_PIPE" "$SEND_PIPE"
     mkfifo "$RECV_PIPE" "$SEND_PIPE"
 
-    # Flag file that socat will create when a connection arrives
     local incoming_flag="$DATA_DIR/run/incoming_$$"
     rm -f "$incoming_flag"
 
-    # Start socat in background — it touches the flag when someone connects
     socat "TCP-LISTEN:$LISTEN_PORT,reuseaddr" \
         "SYSTEM:touch $incoming_flag; cat $SEND_PIPE & cat > $RECV_PIPE" &
     local socat_pid=$!
     save_pid "socat" "$socat_pid"
 
-    # Wait for an incoming connection (poll for the flag file)
     while [ ! -f "$incoming_flag" ]; do
         if ! kill -0 "$socat_pid" 2>/dev/null; then
             log_err "Listener stopped unexpectedly"
             rm -f "$RECV_PIPE" "$SEND_PIPE" "$incoming_flag"
+            # Restart auto-listener if enabled
+            start_auto_listener
             return 1
         fi
         sleep 0.5
@@ -745,9 +803,10 @@ listen_for_call() {
     touch "$CONNECTED_FLAG"
     log_ok "Call connected!"
     in_call_session "$RECV_PIPE" "$SEND_PIPE" ""
-
-    # Full cleanup after call ends
     cleanup_call
+
+    # Restart auto-listener if enabled
+    start_auto_listener
 }
 
 # Call a remote .onion address
@@ -788,13 +847,29 @@ call_remote() {
     local socat_pid=$!
     save_pid "socat_call" "$socat_pid"
 
+    # Animated connecting indicator while socat establishes connection
+    (
+        local dots=""
+        while true; do
+            for dots in "." ".." "..." "   "; do
+                echo -ne "\r  ${CYAN}${BOLD}Connecting${dots}${NC}   " >&2
+                sleep 0.3
+            done
+        done
+    ) &
+    local spinner_pid=$!
+
     # Give socat a moment to connect
     sleep 2
 
     if kill -0 "$socat_pid" 2>/dev/null; then
-        log_ok "Connected to ${remote_onion}!"
-        in_call_session "$RECV_PIPE" "$SEND_PIPE" "$remote_onion"
+        in_call_session "$RECV_PIPE" "$SEND_PIPE" "$remote_onion" "$spinner_pid"
     else
+        # Kill spinner and show error
+        kill "$spinner_pid" 2>/dev/null || true
+        wait "$spinner_pid" 2>/dev/null || true
+        echo -ne "\r                              " >&2
+        echo "" >&2
         log_err "Failed to connect. Check the address and ensure Tor is running."
     fi
 
@@ -811,13 +886,18 @@ draw_call_header() {
     local _remote="${1:-}"
     local _rcipher="${2:-}"
     clear >&2
+    # Row counter for ANSI cursor positioning (clear sets cursor to row 1)
+    local _r=1
+
     if [ -n "$_remote" ]; then
         echo -e "\n${BOLD}${BG_GREEN}${WHITE} CALL CONNECTED ${NC} ${CYAN}${_remote}${NC}\n" >&2
     else
         echo -e "\n${BOLD}${BG_GREEN}${WHITE} CALL CONNECTED ${NC}\n" >&2
     fi
+    _r=4  # \n(row1) + header(row2) + \n(row3) + echo-newline → cursor at row 4
 
-    # Show cipher info — always show both local and remote
+    # Cipher info
+    CIPHER_ROW=$_r
     local cipher_upper="${CIPHER^^}"
     if [ -n "$_rcipher" ]; then
         local rcipher_upper="${_rcipher^^}"
@@ -832,14 +912,14 @@ draw_call_header() {
         echo -e "  ${GREEN}●${NC} Local cipher:  ${WHITE}${cipher_upper}${NC}" >&2
         echo -e "  ${DIM}●${NC} Remote cipher: ${DIM}waiting...${NC}" >&2
     fi
+    _r=$((_r + 2))
 
-    # Show Snowflake bridge info if enabled
+    # Snowflake bridge info
     if [ "$SNOWFLAKE_ENABLED" -eq 1 ]; then
         local tor_log="$TOR_DIR/tor.log"
-        echo "" >&2
-        echo -e "  ${TOR_PURPLE}●${NC} ${BOLD}Snowflake bridge${NC}" >&2
+        echo "" >&2; _r=$((_r + 1))
+        echo -e "  ${TOR_PURPLE}●${NC} ${BOLD}Snowflake bridge${NC}" >&2; _r=$((_r + 1))
         if [ -f "$tor_log" ]; then
-            # Parse bridge descriptor: "new bridge descriptor 'NAME' (fresh): $FINGERPRINT"
             local bridge_line=""
             bridge_line=$(grep "new bridge descriptor" "$tor_log" 2>/dev/null | tail -1 || true)
             if [ -n "$bridge_line" ]; then
@@ -848,15 +928,14 @@ draw_call_header() {
                 local bridge_fp=""
                 bridge_fp=$(echo "$bridge_line" | sed -n 's/.*(\(fresh\|stale\)): \(.*\)/\2/p' || true)
                 if [ -n "$bridge_name" ]; then
-                    # Truncate fingerprint to fit terminal
                     local fp_display="$bridge_fp"
                     if [ ${#fp_display} -gt 40 ]; then
                         fp_display="${fp_display:0:40}..."
                     fi
                     echo -e "    ${DIM}descriptor:${NC} ${WHITE}${bridge_name}${NC} ${DIM}— ${fp_display}${NC}" >&2
+                    _r=$((_r + 1))
                 fi
             fi
-            # Show managed proxy status
             local proxy_line=""
             proxy_line=$(grep 'Managed proxy.*snowflake' "$tor_log" 2>/dev/null | tail -1 || true)
             if [ -n "$proxy_line" ]; then
@@ -865,23 +944,40 @@ draw_call_header() {
                 else
                     echo -e "    ${DIM}transport:${NC}  ${YELLOW}connecting...${NC}" >&2
                 fi
+                _r=$((_r + 1))
             fi
         fi
     fi
-    echo "" >&2
+    echo "" >&2; _r=$((_r + 1))
 
-    echo -e "  ${BOLD}Controls:${NC}" >&2
-    echo -e "  ${GREEN}[SPACE]${NC} -- Push-to-Talk" >&2
-    echo -e "  ${CYAN}[T]${NC}     -- Send text message" >&2
-    echo -e "  ${YELLOW}[S]${NC}     -- Settings" >&2
-    echo -e "  ${RED}[Q]${NC}     -- Hang up" >&2
-    echo -e "" >&2
+    # Static placeholders — updated in-place via ANSI positioning
+    echo -e "  ${DIM}Last sent:  --${NC}" >&2
+    SENT_INFO_ROW=$_r
+    _r=$((_r + 1))
+
+    echo -e "  ${DIM}Last recv:  --${NC}" >&2
+    RECV_INFO_ROW=$_r
+    _r=$((_r + 1))
+
+    echo "" >&2; _r=$((_r + 1))
+
+    # Static status bar
+    if [ $IS_TERMUX -eq 1 ]; then
+        echo -ne "  ${GREEN}${BOLD} Ready ${NC} ${DIM}[SPACE]=Talk [T]=Chat [S]=Settings [Q]=Hang up${NC}   " >&2
+    else
+        echo -ne "  ${GREEN}${BOLD} Ready ${NC} ${DIM}[SPACE]=Hold to Talk [T]=Chat [S]=Settings [Q]=Hang up${NC}   " >&2
+    fi
+    STATUS_ROW=$_r
+
+    echo "" >&2
+    echo "" >&2
 }
 
 in_call_session() {
     local recv_pipe="$1"
     local send_pipe="$2"
     local known_remote="${3:-}"
+    local spinner_pid="${4:-}"
 
     CALL_ACTIVE=1
     rm -f "$PTT_FLAG"
@@ -938,7 +1034,11 @@ in_call_session() {
         echo "$remote_cipher" > "$remote_cipher_file"
     fi
 
-    # Draw call header
+    # Kill connecting spinner and draw call header
+    if [ -n "$spinner_pid" ]; then
+        kill "$spinner_pid" 2>/dev/null || true
+        wait "$spinner_pid" 2>/dev/null || true
+    fi
     draw_call_header "$remote_display" "$remote_cipher"
 
     # Start receive handler in background
@@ -950,13 +1050,16 @@ in_call_session() {
             if read -r line <&3 2>/dev/null; then
                 case "$line" in
                     PTT_START)
-                        echo -ne "\r  ${BG_GREEN}${WHITE}${BOLD} REMOTE TALKING ${NC}   "
+                        printf '\033[s' >&2
+                        printf '\033[%d;1H\033[K' "$STATUS_ROW" >&2
+                        printf '  \033[42;1;37m REMOTE TALKING \033[0m   ' >&2
+                        printf '\033[u' >&2
                         ;;
                     PTT_STOP)
-                        echo -ne "\r  ${DIM} Remote idle       ${NC}   "
+                        # silent — Last recv row provides feedback
                         ;;
                     PING)
-                        echo -ne "\r  ${DIM} Ping received     ${NC}   "
+                        # silent — no display update
                         ;;
                     ID:*)
                         # Caller ID received (save but don't print — already in header)
@@ -980,7 +1083,7 @@ in_call_session() {
                             _dot_color="$RED"
                         fi
                         printf '\033[s' >&2
-                        printf '\033[4;1H\033[K' >&2
+                        printf '\033[%d;1H\033[K' "$CIPHER_ROW" >&2
                         printf '  %b●%b Local cipher:  %b%s%b\r\n' "$_dot_color" "$NC" "$WHITE" "$_cu" "$NC" >&2
                         printf '\033[K' >&2
                         printf '  %b●%b Remote cipher: %b%s%b' "$_dot_color" "$NC" "$WHITE" "$_ru" "$NC" >&2
@@ -997,7 +1100,7 @@ in_call_session() {
                             if decrypt_file "$msg_enc" "$msg_dec" 2>/dev/null; then
                                 local msg_text
                                 msg_text=$(cat "$msg_dec" 2>/dev/null)
-                                echo -e "\r\n  ${MAGENTA}${BOLD}[MSG]${NC} ${WHITE}${msg_text}${NC}" >&2
+                                echo -e "\n  ${MAGENTA}${BOLD}[MSG]${NC} ${WHITE}${msg_text}${NC}" >&2
                             fi
                         fi
                         rm -f "$msg_enc" "$msg_dec" 2>/dev/null
@@ -1012,6 +1115,19 @@ in_call_session() {
                         echo "$b64_data" | base64 -d > "$enc_file" 2>/dev/null || true
                         if [ -s "$enc_file" ]; then
                             if decrypt_file "$enc_file" "$dec_file" 2>/dev/null; then
+                                # Calculate recv size
+                                local _enc_sz=0
+                                _enc_sz=$(stat -c%s "$enc_file" 2>/dev/null || echo 0)
+                                local _sz_kb=$(( _enc_sz * 10 / 1024 ))
+                                local _sz_w=$(( _sz_kb / 10 ))
+                                local _sz_f=$(( _sz_kb % 10 ))
+                                local _recv_info="${_sz_w}.${_sz_f}KB"
+                                # Update static "Last recv" row via ANSI positioning
+                                printf '\033[s' >&2
+                                printf '\033[%d;1H\033[K' "$RECV_INFO_ROW" >&2
+                                printf '  \033[2mLast recv:  \033[0m\033[1;37m%s\033[0m' "$_recv_info" >&2
+                                printf '\033[u' >&2
+
                                 play_chunk "$dec_file" 2>/dev/null || true
                             fi
                         fi
@@ -1041,36 +1157,44 @@ in_call_session() {
 
     REC_PID=""
     REC_FILE=""
+    LAST_SENT_INFO=""
     local ptt_active=0
 
-    if [ $IS_TERMUX -eq 1 ]; then
-        echo -ne "\r  ${GREEN}${BOLD} Ready ${NC} ${DIM}[SPACE]=Talk [T]=Chat [S]=Settings [Q]=Hang up${NC}   " >&2
-    else
-        echo -ne "\r  ${GREEN}${BOLD} Ready ${NC} ${DIM}[SPACE]=Hold to Talk [T]=Chat [S]=Settings [Q]=Hang up${NC}   " >&2
-    fi
+    # Status bar is already drawn by draw_call_header
 
     while [ -f "$CONNECTED_FLAG" ]; do
         local key=""
         key=$(dd bs=1 count=1 2>/dev/null) || true
 
-        if [ "$key" = " " ]; then
+        if [ "$key" = "$PTT_KEY" ]; then
             if [ $IS_TERMUX -eq 1 ]; then
                 # TERMUX: Toggle mode
                 if [ $ptt_active -eq 0 ]; then
                     ptt_active=1
-                    echo -ne "\r  ${BG_RED}${WHITE}${BOLD} ● RECORDING ${NC} ${DIM}[SPACE]=Send${NC}        " >&2
+                    printf '\033[s' >&2; printf '\033[%d;1H\033[K' "$STATUS_ROW" >&2
+                    printf '  \033[41;1;37m \u25cf RECORDING \033[0m \033[2m[SPACE]=Send\033[0m        ' >&2
+                    printf '\033[u' >&2
                     start_recording
                 else
                     ptt_active=0
                     stop_and_send
                     echo "PTT_STOP" >&4 2>/dev/null || true
-                    echo -ne "\r  ${GREEN}${BOLD} Sent! ${NC} ${DIM}[SPACE]=Talk [T]=Chat [S]=Settings [Q]=Hang up${NC}   " >&2
+                    # Update Last sent + status bar
+                    printf '\033[s' >&2
+                    printf '\033[%d;1H\033[K' "$SENT_INFO_ROW" >&2
+                    printf '  \033[2mLast sent:  \033[0m\033[1;37m%s\033[0m' "$LAST_SENT_INFO" >&2
+                    printf '\033[%d;1H\033[K' "$STATUS_ROW" >&2
+                    printf '  \033[1;32m Sent! \033[0m \033[2m[SPACE]=Talk [T]=Chat [S]=Settings [Q]=Hang up\033[0m   ' >&2
+                    printf '\033[u' >&2
                 fi
             else
                 # LINUX: Hold-to-talk
                 if [ $ptt_active -eq 0 ]; then
                     ptt_active=1
-                    echo -ne "\r  ${BG_RED}${WHITE}${BOLD}${BLINK} ● RECORDING ${NC}                " >&2
+                    printf '\033[s' >&2; printf '\033[%d;1H\033[K' "$STATUS_ROW" >&2
+                    printf '  \033[41;1;37;5m \u25cf RECORDING \033[0m                ' >&2
+                    printf '\033[u' >&2
+                    stty time 5  # longer timeout to span keyboard repeat delay
                     start_recording
                 fi
             fi
@@ -1095,17 +1219,24 @@ in_call_session() {
         elif [ -z "$key" ]; then
             # No key pressed (timeout) — on Linux, release = stop and send
             if [ $IS_TERMUX -eq 0 ] && [ $ptt_active -eq 1 ]; then
+                stty time 1  # restore fast timeout for key detection
                 ptt_active=0
                 stop_and_send
                 echo "PTT_STOP" >&4 2>/dev/null || true
-                echo -ne "\r  ${GREEN}${BOLD} Sent! ${NC} ${DIM}[SPACE]=Hold to Talk [T]=Chat [S]=Settings [Q]=Hang up${NC}   " >&2
+                # Update Last sent + status bar
+                printf '\033[s' >&2
+                printf '\033[%d;1H\033[K' "$SENT_INFO_ROW" >&2
+                printf '  \033[2mLast sent:  \033[0m\033[1;37m%s\033[0m' "$LAST_SENT_INFO" >&2
+                printf '\033[%d;1H\033[K' "$STATUS_ROW" >&2
+                printf '  \033[1;32m Sent! \033[0m \033[2m[SPACE]=Hold to Talk [T]=Chat [S]=Settings [Q]=Hang up\033[0m   ' >&2
+                printf '\033[u' >&2
             fi
 
         elif [ "$key" = "t" ] || [ "$key" = "T" ]; then
             # Text chat mode
             # Switch to cooked mode for text input
             stty "$ORIGINAL_STTY" 2>/dev/null || stty sane
-            echo -e "\r                                                              " >&2
+            echo "" >&2
             echo -ne "  ${CYAN}${BOLD}MSG>${NC} " >&2
             local chat_msg=""
             read -r chat_msg
@@ -1126,12 +1257,15 @@ in_call_session() {
             fi
             # Switch back to raw mode for PTT
             stty raw -echo -icanon min 0 time 1
-            echo "" >&2
+            # Restore status bar to Ready
+            printf '\033[s' >&2
+            printf '\033[%d;1H\033[K' "$STATUS_ROW" >&2
             if [ $IS_TERMUX -eq 1 ]; then
-                echo -ne "  ${GREEN}${BOLD} Ready ${NC} ${DIM}[SPACE]=Talk [T]=Chat [S]=Settings [Q]=Hang up${NC}   " >&2
+                printf '  \033[1;32m Ready \033[0m \033[2m[SPACE]=Talk [T]=Chat [S]=Settings [Q]=Hang up\033[0m   ' >&2
             else
-                echo -ne "  ${GREEN}${BOLD} Ready ${NC} ${DIM}[SPACE]=Hold to Talk [T]=Chat [S]=Settings [Q]=Hang up${NC}   " >&2
+                printf '  \033[1;32m Ready \033[0m \033[2m[SPACE]=Hold to Talk [T]=Chat [S]=Settings [Q]=Hang up\033[0m   ' >&2
             fi
+            printf '\033[u' >&2
 
         elif [ "$key" = "s" ] || [ "$key" = "S" ]; then
             # Mid-call settings
@@ -1146,11 +1280,15 @@ in_call_session() {
             [ -f "$remote_cipher_file" ] && _rc=$(cat "$remote_cipher_file" 2>/dev/null)
             draw_call_header "$_rd" "$_rc"
             stty raw -echo -icanon min 0 time 1
+            # Restore status bar to Ready (header was redrawn, STATUS_ROW is fresh)
+            printf '\033[s' >&2
+            printf '\033[%d;1H\033[K' "$STATUS_ROW" >&2
             if [ $IS_TERMUX -eq 1 ]; then
-                echo -ne "  ${GREEN}${BOLD} Ready ${NC} ${DIM}[SPACE]=Talk [T]=Chat [S]=Settings [Q]=Hang up${NC}   " >&2
+                printf '  \033[1;32m Ready \033[0m \033[2m[SPACE]=Talk [T]=Chat [S]=Settings [Q]=Hang up\033[0m   ' >&2
             else
-                echo -ne "  ${GREEN}${BOLD} Ready ${NC} ${DIM}[SPACE]=Hold to Talk [T]=Chat [S]=Settings [Q]=Hang up${NC}   " >&2
+                printf '  \033[1;32m Ready \033[0m \033[2m[SPACE]=Hold to Talk [T]=Chat [S]=Settings [Q]=Hang up\033[0m   ' >&2
             fi
+            printf '\033[u' >&2
         fi
     done
 
@@ -1320,11 +1458,23 @@ settings_menu() {
         if [ "$SNOWFLAKE_ENABLED" -eq 1 ]; then
             sf_label="${GREEN}enabled${NC}"
         fi
-        echo -e "  ${DIM}Snowflake bridge:     ${NC}${sf_label}\n"
+        echo -e "  ${DIM}Snowflake bridge:     ${NC}${sf_label}"
+
+        local al_label="${RED}disabled${NC}"
+        if [ "$AUTO_LISTEN" -eq 1 ]; then
+            al_label="${GREEN}enabled${NC}"
+        fi
+        echo -e "  ${DIM}Auto-listen:          ${NC}${al_label}"
+
+        local ptt_display="SPACE"
+        [ "$PTT_KEY" != " " ] && ptt_display="$PTT_KEY"
+        echo -e "  ${DIM}PTT key:              ${NC}${WHITE}${ptt_display}${NC}\n"
 
         echo -e "  ${BOLD}${WHITE}1${NC} ${CYAN}│${NC} Change encryption cipher"
         echo -e "  ${BOLD}${WHITE}2${NC} ${CYAN}│${NC} Change Opus encoding quality"
         echo -e "  ${BOLD}${WHITE}3${NC} ${CYAN}│${NC} Snowflake bridge (censorship circumvention)"
+        echo -e "  ${BOLD}${WHITE}4${NC} ${CYAN}│${NC} Auto-listen (listen for calls automatically once Tor starts)"
+        echo -e "  ${BOLD}${WHITE}5${NC} ${CYAN}│${NC} Change PTT (push-to-talk) key"
         echo -e "  ${BOLD}${WHITE}0${NC} ${CYAN}│${NC} ${DIM}Back to main menu${NC}"
         echo ""
         echo -ne "  ${BOLD}Select: ${NC}"
@@ -1334,6 +1484,40 @@ settings_menu() {
             1) settings_cipher ;;
             2) settings_opus ;;
             3) settings_snowflake ;;
+            4)
+                if [ "$AUTO_LISTEN" -eq 1 ]; then
+                    AUTO_LISTEN=0
+                    stop_auto_listener
+                    log_ok "Auto-listen disabled"
+                else
+                    AUTO_LISTEN=1
+                    log_ok "Auto-listen enabled"
+                    start_auto_listener
+                fi
+                save_config
+                sleep 1
+                ;;
+            5)
+                local _pd="SPACE"
+                [ "$PTT_KEY" != " " ] && _pd="$PTT_KEY"
+                echo -e "\n  ${DIM}Current PTT key: ${NC}${WHITE}${_pd}${NC}"
+                echo -ne "  ${BOLD}Press the key you want to use for PTT: ${NC}"
+                # Read a single character in raw mode
+                local _old_stty
+                _old_stty=$(stty -g)
+                stty raw -echo
+                local _newkey
+                _newkey=$(dd bs=1 count=1 2>/dev/null) || true
+                stty "$_old_stty"
+                if [ -n "$_newkey" ]; then
+                    PTT_KEY="$_newkey"
+                    save_config
+                    local _nd="SPACE"
+                    [ "$PTT_KEY" != " " ] && _nd="$PTT_KEY"
+                    log_ok "PTT key set to: ${_nd}"
+                fi
+                sleep 1
+                ;;
             0|q|Q) return ;;
             *)
                 echo -e "\n  ${RED}Invalid choice${NC}"
@@ -1613,8 +1797,14 @@ main_menu() {
         if [ "$SNOWFLAKE_ENABLED" -eq 1 ]; then
             sf_status="${GREEN}●${NC}"
         fi
+        local al_status="${RED}●${NC}"
+        if [ "$AUTO_LISTEN" -eq 1 ]; then
+            al_status="${GREEN}●${NC}"
+        fi
+        local _ptt_d="SPACE"
+        [ "$PTT_KEY" != " " ] && _ptt_d="$PTT_KEY"
 
-        echo -e "  ${DIM}Tor:${NC} $tor_status  ${DIM}Secret:${NC} $secret_status  ${DIM}SF:${NC} $sf_status  ${DIM}PTT:${NC} ${GREEN}[SPACE]${NC}\n"
+        echo -e "  ${DIM}Tor:${NC} $tor_status  ${DIM}Secret:${NC} $secret_status  ${DIM}SF:${NC} $sf_status  ${DIM}AL:${NC} $al_status  ${DIM}PTT:${NC} ${GREEN}[${_ptt_d}]${NC}\n"
 
         echo -e "  ${BOLD}${WHITE}1${NC} ${CYAN}│${NC} Listen for calls"
         echo -e "  ${BOLD}${WHITE}2${NC} ${CYAN}│${NC} Call an onion address"
@@ -1632,7 +1822,26 @@ main_menu() {
         echo ""
         echo -ne "  ${BOLD}Select: ${NC}"
 
-        read -r choice
+        # If auto-listen is active, poll for incoming calls without redrawing
+        local choice=""
+        if [ "$AUTO_LISTEN" -eq 1 ] && [ -n "$AUTO_LISTEN_PID" ]; then
+            echo -ne "${DIM}[Auto-listening...]${NC} " >&2
+            while true; do
+                # Check for incoming call
+                if check_auto_listen; then
+                    choice=""
+                    break
+                fi
+                # Try to read user input with short timeout
+                if read -r -t 1 choice 2>/dev/null; then
+                    break  # user typed something
+                fi
+            done
+        else
+            read -r choice
+        fi
+
+        [ -z "$choice" ] && continue
 
         case "$choice" in
             1) listen_for_call ;;
@@ -1663,6 +1872,7 @@ main_menu() {
                ;;
             8)
                 start_tor
+                start_auto_listener
                 echo -ne "\n  ${DIM}Press Enter to continue...${NC}"
                 read -r
                 ;;
@@ -1674,6 +1884,7 @@ main_menu() {
             10)
                 stop_tor
                 start_tor
+                start_auto_listener
                 echo -ne "\n  ${DIM}Press Enter to continue...${NC}"
                 read -r
                 ;;
