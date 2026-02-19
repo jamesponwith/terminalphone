@@ -318,6 +318,12 @@ If the script hangs after pressing Q, press Ctrl+C to force cleanup and return t
 
 ---
 
+Donate Monero 
+
+49UzKejMqAeNGEG3C7cY99SUdxUjmWPqaa3s2k986WdcYz2hNfRUmDwa92odn9NLBdhwoWnx3hno5UEe1xYVb8ps92h3Qpt
+
+---
+
 ## License
 
 MIT
