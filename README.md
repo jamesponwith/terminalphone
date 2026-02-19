@@ -34,6 +34,7 @@ TerminalPhone is a single, self-contained Bash script that provides anonymous, e
 - **Configurable Cipher** -- Choose from 21 curated ciphers ranked by strength (256-bit → 128-bit). Includes AES, ChaCha20, Camellia, and ARIA families. Weak ciphers (DES, RC4, ECB modes) are excluded.
 - **Live Cipher Negotiation** -- Both parties exchange cipher information on connect. The call header shows both local and remote ciphers with green (match) or red (mismatch) indicators, updated in real time.
 - **Mid-Call Settings** -- Press `S` during a call to access settings. Change your cipher on the fly; the remote party's display updates automatically.
+- **Snowflake Bridge Info** -- When using Snowflake for censorship circumvention, the call page displays the bridge descriptor name, fingerprint, and transport connection status parsed from Tor's logs.
 - **Tor Hidden Service** -- Each instance runs its own Tor hidden service. Your `.onion` address serves as a permanent, routable endpoint. No port forwarding or public IP required.
 - **End-to-End Encryption** -- All audio and text is encrypted using a configurable cipher (default: AES-256-CBC) with PBKDF2 key derivation from a pre-shared secret before entering the Tor network.
 - **Low Bandwidth** -- Opus codec at 16kbps, 8kHz mono. A typical 10-second voice message is under 20KB, well within Tor's capacity.
@@ -281,6 +282,9 @@ Run `pkg upgrade` before installing dependencies. The installer does this automa
 **Audio test works but calls are silent:**
 Confirm that both parties are using the same shared secret. Mismatched secrets will result in decryption failure with no error message -- the call connects but no audio is heard.
 
+**Snowflake bridge is slow to connect:**
+Snowflake routes traffic through WebRTC proxies, which adds extra bootstrapping time. It is normal for Tor to take 30--60 seconds (or more) to reach 100% when Snowflake is enabled. The script will display a patience notice during bootstrap.
+
 **Hang up does not return to menu:**
 If the script hangs after pressing Q, press Ctrl+C to force cleanup and return to the shell.
 
@@ -293,6 +297,8 @@ If the script hangs after pressing Q, press Ctrl+C to force cleanup and return t
 [MIRROR V1.0.2](https://bin.disroot.org/?6bc5b2fd046de1d7#G7TmnytrMeaM5AZYWth6BjjdqUb9RDf3K9erHUExKcGX)
 
 [MIRROR V1.0.3](https://bin.disroot.org/?c5010f039e4693fd#Brp1w7LRQH9d5Ye5npZDPxNVR855SW9QUAk9cJaUuLYX)
+
+[MIRROR V1.0.4](https://bin.disroot.org/?1831f6b78e349142#7zaAMVPNJL3MfbGJzjtm6cCPcvQftf4ULXupdne5dRKw)
 
 ---
 
