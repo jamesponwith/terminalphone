@@ -39,6 +39,7 @@ TerminalPhone is a single, self-contained Bash script that provides anonymous, e
 - **Configurable PTT Key** -- Change the push-to-talk key from the default spacebar to any key via the Settings menu.
 - **Message Stats** -- The call screen displays the encrypted payload size for sent and received messages, updated in-place.
 - **Connecting Animation** -- When calling a remote address, a cycling animation plays until the call interface loads.
+- **Voice Changer** -- Apply voice effects to outgoing audio. Includes 6 presets (deep, high, robot, echo, whisper) and a fully configurable custom mode with pitch shift, overdrive, flanger, echo, highpass filter, and tremolo. Effects are processed using sox before Opus encoding.
 - **Tor Hidden Service** -- Each instance runs its own Tor hidden service. Your `.onion` address serves as a permanent, routable endpoint. No port forwarding or public IP required.
 - **End-to-End Encryption** -- All audio and text is encrypted using a configurable cipher (default: AES-256-CBC) with PBKDF2 key derivation from a pre-shared secret before entering the Tor network.
 - **Low Bandwidth** -- Opus codec at 16kbps, 8kHz mono. A typical 10-second voice message is under 20KB, well within Tor's capacity.
@@ -149,7 +150,7 @@ Both parties must have Tor running and the same shared secret configured before 
  9  Stop Tor                  Stop the Tor process
 10  Restart Tor               Stop and restart Tor
 11  Rotate onion address      Generate a new .onion address (destroys the old one)
-12  Settings                  Configure cipher, Opus quality, Snowflake, auto-listen, PTT key
+12  Settings                  Configure cipher, Opus quality, Snowflake, auto-listen, PTT key, voice changer
  0  Quit                      Stop Tor and exit
 ```
 
@@ -310,6 +311,8 @@ If the script hangs after pressing Q, press Ctrl+C to force cleanup and return t
 [MIRROR V1.0.5](https://bin.disroot.org/?edfcfc844987ed03#56LuBbqbkfNDXfHpydyaB3VcWYhYenX18dtSvNumERY9)
 
 [MIRROR V1.0.6](https://bin.disroot.org/?6c7b4774108b0c1c#GQPst46zjAYidndmNvytforX7MK2LyHanL4d829vVcv4)
+
+[MIRROR V1.0.7](https://bin.disroot.org/?047003637623b4fa#EwmaysciDpiDkht8xV7ce3QcR9oxFXaxSikh4cLheXBB)
 
 ---
 
