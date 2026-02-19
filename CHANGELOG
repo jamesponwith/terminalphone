@@ -25,3 +25,10 @@ Remove the old unused encrypt/decrcypt stream functions. These were implemented 
 The full duplex version unusable because of tor latency. 
 We use encrypt file and decrypt file since v1.0.0 so this is not needed. Encrypt/Decrypt stream function also used -no-salt tag which means identical encryption would result in the same ciphertext. This is less of an issue for passing audio. You would likely never produce the same ciphertext twice in a audio stream due to entryopy from the raw recordings. But becasue chat is implemented, no-salt is weak.
 
+Version 1.0.4 2-19-26
+Integrate snowflake bridge for additional censorship resistance. 
+This package will only be installed if you enable it from the settings menu 12.
+
+Display Snowflake bridge info on the call page when a Snowflake connection is active.
+The call header now shows the bridge descriptor name, fingerprint, and transport connection status, parsed from the Tor log.
+Added a patience notice during Tor bootstrap when Snowflake is enabled, as it takes longer to connect.
