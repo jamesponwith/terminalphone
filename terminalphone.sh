@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION
 #=============================================================================
 APP_NAME="TerminalPhone"
-VERSION="1.0.7"
+VERSION="1.0.8"
 BASE_DIR="$(dirname "$(readlink -f "$0")")"
 DATA_DIR="$BASE_DIR/.terminalphone"
 TOR_DIR="$DATA_DIR/tor_data"
@@ -687,12 +687,8 @@ audio_play() {
     local rate="${2:-48000}"
 
     if [ $IS_TERMUX -eq 1 ]; then
-        # Termux: use Android's native media player
-        termux-media-player play "$infile" &>/dev/null || true
-        # Wait for playback to finish
-        while termux-media-player info 2>/dev/null | grep -q "playing"; do
-            sleep 0.5
-        done
+        # Termux: use sox play (avoids Android MediaPlayer indexing)
+        play -q -t raw -r "$rate" -e signed -b 16 -c 1 "$infile" 2>/dev/null || true
     else
         # Linux: use ALSA aplay
         aplay -f S16_LE -r "$rate" -c 1 -q "$infile" 2>/dev/null
@@ -706,13 +702,9 @@ play_chunk() {
     local opus_file="$1"
 
     if [ $IS_TERMUX -eq 1 ]; then
-        # Termux: decode to wav, play via Android media player
-        local wav_file="$AUDIO_DIR/play_$(uid).wav"
-        opusdec --quiet "$opus_file" "$wav_file" 2>/dev/null || true
-        if [ -s "$wav_file" ]; then
-            audio_play "$wav_file"
-        fi
-        rm -f "$wav_file"
+        # Termux: pipe decode directly to sox play (avoids temp file + Android media framework)
+        opusdec --quiet --rate 48000 "$opus_file" - 2>/dev/null | \
+            play -q -t raw -r 48000 -e signed -b 16 -c 1 - 2>/dev/null || true
     else
         # Linux: pipe decode directly to aplay
         opusdec --quiet --rate 48000 "$opus_file" - 2>/dev/null | \
