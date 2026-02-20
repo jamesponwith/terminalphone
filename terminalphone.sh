@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION
 #=============================================================================
 APP_NAME="TerminalPhone"
-VERSION="1.0.9"
+VERSION="1.1.0"
 BASE_DIR="$(dirname "$(readlink -f "$0")")"
 DATA_DIR="$BASE_DIR/.terminalphone"
 TOR_DIR="$DATA_DIR/tor_data"
@@ -158,7 +158,56 @@ load_config() {
         source "$CONFIG_FILE"
     fi
     if [ -f "$SECRET_FILE" ]; then
-        SHARED_SECRET=$(cat "$SECRET_FILE")
+        # Check if the file is OpenSSL-encrypted (starts with "Salted__")
+        local magic
+        magic=$(head -c 8 "$SECRET_FILE" 2>/dev/null | cat -v)
+        if [[ "$magic" == "Salted__"* ]]; then
+            # Encrypted secret — prompt for passphrase
+            echo -ne "  ${BOLD}Enter passphrase to unlock shared secret: ${NC}"
+            read -rs _unlock_pass
+            echo ""
+            if [ -n "$_unlock_pass" ]; then
+                SHARED_SECRET=$(openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+                    -pass "fd:3" -in "$SECRET_FILE" 3<<< "${_unlock_pass}" 2>/dev/null) || true
+                if [ -z "$SHARED_SECRET" ]; then
+                    log_warn "Failed to unlock secret (wrong passphrase?)"
+                    log_info "You can re-enter the secret with option 4"
+                else
+                    log_ok "Shared secret unlocked"
+                fi
+            else
+                log_warn "No passphrase entered — secret not loaded"
+                SHARED_SECRET=""
+            fi
+        else
+            # Plaintext secret (legacy) — load directly
+            SHARED_SECRET=$(cat "$SECRET_FILE")
+            if [ -n "$SHARED_SECRET" ]; then
+                log_info "Plaintext secret detected"
+                echo -ne "  ${BOLD}Protect it with a passphrase? [Y/n]: ${NC}"
+                read -r _migrate
+                if [ "$_migrate" != "n" ] && [ "$_migrate" != "N" ]; then
+                    echo -ne "  ${BOLD}Choose a passphrase: ${NC}"
+                    read -rs _new_pass
+                    echo ""
+                    if [ -n "$_new_pass" ]; then
+                        echo -ne "  ${BOLD}Confirm passphrase: ${NC}"
+                        read -rs _confirm_pass
+                        echo ""
+                        if [ "$_new_pass" = "$_confirm_pass" ]; then
+                            echo -n "$SHARED_SECRET" | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 \
+                                -pass "fd:3" -out "$SECRET_FILE" 3<<< "${_new_pass}" 2>/dev/null
+                            chmod 600 "$SECRET_FILE"
+                            log_ok "Secret encrypted with passphrase"
+                        else
+                            log_warn "Passphrases don't match — keeping plaintext"
+                        fi
+                    else
+                        log_warn "Empty passphrase — keeping plaintext"
+                    fi
+                fi
+            fi
+        fi
     else
         SHARED_SECRET=""
     fi
@@ -514,7 +563,34 @@ set_shared_secret() {
 
     SHARED_SECRET="$new_secret"
     mkdir -p "$DATA_DIR"
-    echo "$SHARED_SECRET" > "$SECRET_FILE"
+
+    echo -ne "\n  ${BOLD}Protect with a passphrase? [Y/n]: ${NC}"
+    read -r _protect
+    if [ "$_protect" != "n" ] && [ "$_protect" != "N" ]; then
+        echo -ne "  ${BOLD}Choose a passphrase: ${NC}"
+        read -rs _pass
+        echo ""
+        if [ -n "$_pass" ]; then
+            echo -ne "  ${BOLD}Confirm passphrase: ${NC}"
+            read -rs _pass2
+            echo ""
+            if [ "$_pass" = "$_pass2" ]; then
+                echo -n "$SHARED_SECRET" | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 \
+                    -pass "fd:3" -out "$SECRET_FILE" 3<<< "${_pass}" 2>/dev/null
+                chmod 600 "$SECRET_FILE"
+                log_ok "Shared secret saved (encrypted with passphrase)"
+                return
+            else
+                log_warn "Passphrases don't match"
+            fi
+        else
+            log_warn "Empty passphrase"
+        fi
+        log_info "Falling back to plaintext storage"
+    fi
+
+    # Plaintext fallback
+    echo -n "$SHARED_SECRET" > "$SECRET_FILE"
     chmod 600 "$SECRET_FILE"
     log_ok "Shared secret saved"
 }
@@ -525,8 +601,8 @@ encrypt_file() {
     local infile="$1" outfile="$2"
     local c="$CIPHER"
     [ -f "$CIPHER_RUNTIME_FILE" ] && c=$(cat "$CIPHER_RUNTIME_FILE")
-    openssl enc -"${c}" -pbkdf2 -iter 10000 -pass "pass:${SHARED_SECRET}" \
-        -in "$infile" -out "$outfile" 2>/dev/null
+    openssl enc -"${c}" -pbkdf2 -iter 10000 -pass "fd:3" \
+        -in "$infile" -out "$outfile" 3<<< "${SHARED_SECRET}" 2>/dev/null
 }
 
 # Decrypt a file
@@ -534,8 +610,8 @@ decrypt_file() {
     local infile="$1" outfile="$2"
     local c="$CIPHER"
     [ -f "$CIPHER_RUNTIME_FILE" ] && c=$(cat "$CIPHER_RUNTIME_FILE")
-    openssl enc -d -"${c}" -pbkdf2 -iter 10000 -pass "pass:${SHARED_SECRET}" \
-        -in "$infile" -out "$outfile" 2>/dev/null
+    openssl enc -d -"${c}" -pbkdf2 -iter 10000 -pass "fd:3" \
+        -in "$infile" -out "$outfile" 3<<< "${SHARED_SECRET}" 2>/dev/null
 }
 
 #=============================================================================
