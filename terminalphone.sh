@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION
 #=============================================================================
 APP_NAME="TerminalPhone"
-VERSION="1.0.8"
+VERSION="1.0.9"
 BASE_DIR="$(dirname "$(readlink -f "$0")")"
 DATA_DIR="$BASE_DIR/.terminalphone"
 TOR_DIR="$DATA_DIR/tor_data"
@@ -40,6 +40,7 @@ CIPHER="aes-256-cbc"  # OpenSSL cipher for encryption
 SNOWFLAKE_ENABLED=0   # Snowflake bridge (off by default)
 AUTO_LISTEN=0         # Auto-listen after Tor starts (off by default)
 VOICE_EFFECT="none"   # Voice effect (none, deep, high, robot, echo, whisper, custom)
+VOL_PTT=0             # Volume-down double-tap PTT (Termux only, experimental)
 
 # Custom voice effect parameters (used when VOICE_EFFECT=custom)
 VOICE_PITCH=0         # Pitch shift in cents (-600 to +600, 0=off)
@@ -182,6 +183,7 @@ VOICE_ECHO_DELAY=$VOICE_ECHO_DELAY
 VOICE_ECHO_DECAY=$VOICE_ECHO_DECAY
 VOICE_HIGHPASS=$VOICE_HIGHPASS
 VOICE_TREMOLO=$VOICE_TREMOLO
+VOL_PTT=$VOL_PTT
 EOF
 }
 
@@ -226,7 +228,13 @@ install_deps() {
     fi
 
     echo -e "\n${YELLOW}Missing dependencies: ${deps_needed[*]}${NC}"
-    echo -e "Attempting to install...\n"
+    echo -ne "\n${BOLD}Install missing dependencies? [Y/n]: ${NC}"
+    read -r _install_confirm
+    if [ "$_install_confirm" = "n" ] || [ "$_install_confirm" = "N" ]; then
+        echo -e "\n  ${YELLOW}Installation skipped.${NC}"
+        return 1
+    fi
+    echo ""
 
     # Use sudo only if available and not on Termux
     local SUDO="sudo"
@@ -754,6 +762,13 @@ cleanup_call() {
     # Wait briefly for processes to die
     sleep 0.2
 
+    # Kill volume monitor if active
+    if [ -n "$VOL_MON_PID" ]; then
+        kill "$VOL_MON_PID" 2>/dev/null || true
+        kill -9 "$VOL_MON_PID" 2>/dev/null || true
+        VOL_MON_PID=""
+    fi
+
     # Remove all runtime files for this PID
     rm -f "$PTT_FLAG" "$CONNECTED_FLAG"
     rm -f "$RECV_PIPE" "$SEND_PIPE"
@@ -761,6 +776,7 @@ cleanup_call() {
     rm -f "$DATA_DIR/run/remote_id_$$"
     rm -f "$DATA_DIR/run/remote_cipher_$$"
     rm -f "$DATA_DIR/run/incoming_$$"
+    rm -f "$DATA_DIR/run/vol_ptt_trigger_$$"
 
     # Clean temp audio files
     rm -f "$AUDIO_DIR"/*.opus "$AUDIO_DIR"/*.bin "$AUDIO_DIR"/*.txt "$AUDIO_DIR"/*.wav 2>/dev/null || true
@@ -799,6 +815,90 @@ stop_auto_listener() {
         AUTO_LISTEN_PID=""
     fi
     rm -f "$AUTO_LISTEN_FLAG" "$RECV_PIPE" "$SEND_PIPE"
+}
+
+#=============================================================================
+# VOLUME-DOWN DOUBLE-TAP PTT MONITOR (Termux only, experimental)
+#=============================================================================
+VOL_MON_PID=""
+
+start_vol_monitor() {
+    local trigger_file="${1:-$DATA_DIR/run/vol_ptt_trigger_$$}"
+    [ "$VOL_PTT" -ne 1 ] && return
+    [ "$IS_TERMUX" -ne 1 ] && return
+    if ! check_dep jq; then
+        log_warn "jq not found — Volume PTT disabled"
+        return
+    fi
+    if ! check_dep termux-volume; then
+        log_warn "termux-volume not found — Volume PTT disabled"
+        return
+    fi
+
+    rm -f "$trigger_file"
+
+    (
+        local last_vol=""
+        local last_tap=0
+        local restore_vol=""
+
+        while [ -f "$CONNECTED_FLAG" ]; do
+            local cur_vol
+            cur_vol=$(termux-volume 2>/dev/null \
+                | jq -r '.[] | select(.stream=="music") | .volume' 2>/dev/null \
+                || echo "")
+
+            # Remember the initial volume so we can restore after detection
+            if [ -n "$cur_vol" ] && [ -z "$restore_vol" ]; then
+                restore_vol="$cur_vol"
+            fi
+
+            if [ -n "$cur_vol" ] && [ -n "$last_vol" ]; then
+                local drop=$(( last_vol - cur_vol ))
+
+                if [ "$drop" -ge 2 ] 2>/dev/null; then
+                    # Rapid double-tap: both presses landed in one poll cycle
+                    touch "$trigger_file"
+                    last_tap=0
+                    # Restore volume for next use
+                    if [ -n "$restore_vol" ]; then
+                        termux-volume music "$restore_vol" 2>/dev/null || true
+                        last_vol="$restore_vol"
+                        sleep 0.5
+                        continue
+                    fi
+                elif [ "$drop" -ge 1 ] 2>/dev/null; then
+                    # Single press — check if second press follows within 1s
+                    local now
+                    now=$(date +%s)
+                    if [ "$last_tap" -gt 0 ] && [ $((now - last_tap)) -le 1 ]; then
+                        touch "$trigger_file"
+                        last_tap=0
+                        if [ -n "$restore_vol" ]; then
+                            termux-volume music "$restore_vol" 2>/dev/null || true
+                            last_vol="$restore_vol"
+                            sleep 0.5
+                            continue
+                        fi
+                    else
+                        last_tap=$now
+                    fi
+                fi
+            fi
+            last_vol="$cur_vol"
+            sleep 0.4
+        done
+    ) &
+    VOL_MON_PID=$!
+}
+
+stop_vol_monitor() {
+    if [ -n "$VOL_MON_PID" ]; then
+        kill "$VOL_MON_PID" 2>/dev/null || true
+        kill -9 "$VOL_MON_PID" 2>/dev/null || true
+        VOL_MON_PID=""
+    fi
+    rm -f "$DATA_DIR/run/vol_ptt_trigger_$$"
 }
 
 # Check if an incoming call arrived on the background listener
@@ -1045,6 +1145,12 @@ in_call_session() {
     rm -f "$PTT_FLAG"
     mkdir -p "$AUDIO_DIR"
 
+    # Start volume-down double-tap monitor (Termux only)
+    VOL_MON_PID=""
+    local vol_trigger_file="$DATA_DIR/run/vol_ptt_trigger_$$"
+    rm -f "$vol_trigger_file"
+    start_vol_monitor "$vol_trigger_file"
+
     # Write cipher to runtime file so subshells can track changes
     echo "$CIPHER" > "$CIPHER_RUNTIME_FILE"
 
@@ -1226,7 +1332,13 @@ in_call_session() {
 
     while [ -f "$CONNECTED_FLAG" ]; do
         local key=""
-        key=$(dd bs=1 count=1 2>/dev/null) || true
+        # Check volume-down double-tap trigger
+        if [ -f "$vol_trigger_file" ]; then
+            rm -f "$vol_trigger_file"
+            key="$PTT_KEY"  # simulate PTT key press
+        else
+            key=$(dd bs=1 count=1 2>/dev/null) || true
+        fi
 
         if [ "$key" = "$PTT_KEY" ]; then
             if [ $IS_TERMUX -eq 1 ]; then
@@ -1534,7 +1646,16 @@ settings_menu() {
 
         local vfx_display="${VOICE_EFFECT}"
         [ "$vfx_display" = "none" ] && vfx_display="off"
-        echo -e "  ${DIM}Voice effect:          ${NC}${WHITE}${vfx_display}${NC}\n"
+        echo -e "  ${DIM}Voice effect:          ${NC}${WHITE}${vfx_display}${NC}"
+
+        if [ $IS_TERMUX -eq 1 ]; then
+            local vp_label="${RED}disabled${NC}"
+            if [ "$VOL_PTT" -eq 1 ]; then
+                vp_label="${GREEN}enabled${NC}"
+            fi
+            echo -e "  ${DIM}Volume PTT:            ${NC}${vp_label}  ${DIM}(experimental)${NC}"
+        fi
+        echo ""
 
         echo -e "  ${BOLD}${WHITE}1${NC} ${CYAN}│${NC} Change encryption cipher"
         echo -e "  ${BOLD}${WHITE}2${NC} ${CYAN}│${NC} Change Opus encoding quality"
@@ -1542,6 +1663,9 @@ settings_menu() {
         echo -e "  ${BOLD}${WHITE}4${NC} ${CYAN}│${NC} Auto-listen (listen for calls automatically once Tor starts)"
         echo -e "  ${BOLD}${WHITE}5${NC} ${CYAN}│${NC} Change PTT (push-to-talk) key"
         echo -e "  ${BOLD}${WHITE}6${NC} ${CYAN}│${NC} Voice changer"
+        if [ $IS_TERMUX -eq 1 ]; then
+            echo -e "  ${BOLD}${WHITE}7${NC} ${CYAN}│${NC} Volume PTT ${DIM}(double-tap Vol Down to talk, experimental)${NC}"
+        fi
         echo -e "  ${BOLD}${WHITE}0${NC} ${CYAN}│${NC} ${DIM}Back to main menu${NC}"
         echo ""
         echo -ne "  ${BOLD}Select: ${NC}"
@@ -1586,6 +1710,41 @@ settings_menu() {
                 sleep 1
                 ;;
             6) settings_voice ;;
+            7)
+                if [ $IS_TERMUX -eq 1 ]; then
+                    if [ "$VOL_PTT" -eq 1 ]; then
+                        VOL_PTT=0
+                        log_ok "Volume PTT disabled"
+                    else
+                        if ! check_dep jq; then
+                            echo ""
+                            echo -ne "  ${BOLD}jq is required for Volume PTT. Install now? [Y/n]: ${NC}"
+                            read -r _jq_confirm
+                            if [ "$_jq_confirm" != "n" ] && [ "$_jq_confirm" != "N" ]; then
+                                pkg install -y jq 2>/dev/null || true
+                                if ! check_dep jq; then
+                                    log_err "jq installation failed — Volume PTT not enabled"
+                                    sleep 2
+                                    continue
+                                fi
+                            else
+                                echo -e "\n  ${YELLOW}Volume PTT not enabled (jq not installed)${NC}"
+                                sleep 2
+                                continue
+                            fi
+                        fi
+                        VOL_PTT=1
+                        log_ok "Volume PTT enabled (double-tap Vol Down to toggle recording)"
+                        echo -e "  ${DIM}Note: Each press will lower your device volume.${NC}"
+                        echo -e "  ${DIM}You may want to start with volume at max.${NC}"
+                    fi
+                    save_config
+                    sleep 2
+                else
+                    echo -e "\n  ${RED}Volume PTT is only available in Termux${NC}"
+                    sleep 1
+                fi
+                ;;
             0|q|Q) return ;;
             *)
                 echo -e "\n  ${RED}Invalid choice${NC}"
