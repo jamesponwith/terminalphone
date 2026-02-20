@@ -79,3 +79,9 @@ Volume PTT (Termux only, experimental). New setting in the settings menu that en
 The feature requires jq for parsing the termux-volume JSON output. jq is not installed by default — the user is prompted to install it when enabling the feature.
 
 Dependency installer now prompts before installing. The main menu option 7 (Install Dependencies) now shows missing packages and asks for confirmation before proceeding, instead of auto-installing.
+
+Version 1.1.0 2-20-26
+
+Passphrase-protected shared secret. The shared secret is no longer stored as plaintext by default. When setting a new secret, the user is prompted to encrypt it with a passphrase. The secret is encrypted using AES-256-CBC with 100,000 PBKDF2 iterations. On subsequent launches, the user enters the passphrase to unlock the secret. If the passphrase is skipped, the secret falls back to plaintext storage. Existing plaintext secrets are automatically detected and the user is offered a one-time migration to encrypted storage.
+
+Process visibility fix. All openssl invocations now pass the shared secret via file descriptor (fd:3) instead of the command line (-pass pass:). Previously, the secret was visible to any local process via /proc/<pid>/cmdline while openssl was running. The secret is now passed through a kernel pipe buffer that is not exposed in the process table. This hardens against local privilege escalation and process snooping. Fully backwards compatible — the encrypted output is byte-identical.
