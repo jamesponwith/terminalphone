@@ -40,6 +40,7 @@ TerminalPhone is a single, self-contained Bash script that provides anonymous, e
 - **Message Stats** -- The call screen displays the encrypted payload size for sent and received messages, updated in-place.
 - **Connecting Animation** -- When calling a remote address, a cycling animation plays until the call interface loads.
 - **Voice Changer** -- Apply voice effects to outgoing audio. Includes 6 presets (deep, high, robot, echo, whisper) and a fully configurable custom mode with pitch shift, overdrive, flanger, echo, highpass filter, and tremolo. Effects are processed using sox before Opus encoding.
+- **Volume PTT (Termux)** -- Experimental mode that lets you double-tap the Volume Down button to toggle recording, even when Termux is in the background. Requires `jq` (installed on demand). Volume is automatically restored after each trigger.
 - **Tor Hidden Service** -- Each instance runs its own Tor hidden service. Your `.onion` address serves as a permanent, routable endpoint. No port forwarding or public IP required.
 - **End-to-End Encryption** -- All audio and text is encrypted using a configurable cipher (default: AES-256-CBC) with PBKDF2 key derivation from a pre-shared secret before entering the Tor network.
 - **Low Bandwidth** -- Opus codec at 16kbps, 8kHz mono. A typical 10-second voice message is under 20KB, well within Tor's capacity.
@@ -150,7 +151,7 @@ Both parties must have Tor running and the same shared secret configured before 
  9  Stop Tor                  Stop the Tor process
 10  Restart Tor               Stop and restart Tor
 11  Rotate onion address      Generate a new .onion address (destroys the old one)
-12  Settings                  Configure cipher, Opus quality, Snowflake, auto-listen, PTT key, voice changer
+12  Settings                  Configure cipher, Opus quality, Snowflake, auto-listen, PTT key, voice changer, volume PTT
  0  Quit                      Stop Tor and exit
 ```
 
@@ -175,6 +176,7 @@ Android's software keyboard sends key events on release, not on press. TerminalP
 | T | Send an encrypted text message. |
 | S | Open settings mid-call (change cipher, adjust quality). |
 | Q | Hang up and return to the menu. |
+| Vol Down ×2 | Toggle recording via volume button (requires Volume PTT enabled in settings). |
 
 ### CLI Mode
 
@@ -271,6 +273,7 @@ Default audio parameters (defined at the top of the script):
 | `SNOWFLAKE_ENABLED` | 0 | Snowflake bridge for censorship circumvention |
 | `AUTO_LISTEN` | 0 | Auto-listen for calls when Tor starts |
 | `PTT_KEY` | SPACE | Push-to-talk key (configurable via Settings) |
+| `VOL_PTT` | 0 | Volume-down double-tap PTT, Termux only (experimental) |
 | `SAMPLE_RATE` | 8000 | Audio sample rate in Hz |
 | `CHUNK_DURATION` | 1 | Duration for audio test chunks in seconds |
 
@@ -315,6 +318,8 @@ If the script hangs after pressing Q, press Ctrl+C to force cleanup and return t
 [MIRROR V1.0.7](https://bin.disroot.org/?047003637623b4fa#EwmaysciDpiDkht8xV7ce3QcR9oxFXaxSikh4cLheXBB)
 
 [MIRROR V1.0.8](https://bin.disroot.org/?06e38bd64e6fbdad#88MYs3dmq9rSMkmocpW3NYaaG4YfSdRCc9LJnEEzqGYp)
+
+[MIRROR V1.0.9](https://bin.disroot.org/?950218a9a7c71c66#E7Z94VCGBZozrfXYhGwKyAdMeTxuavg92tA1pn2DbrrB)
 
 ---
 
