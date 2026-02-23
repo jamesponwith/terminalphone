@@ -45,6 +45,8 @@ TerminalPhone is a single, self-contained Bash script that provides anonymous, e
 - **End-to-End Encryption** -- All audio and text is encrypted using a configurable cipher (default: AES-256-CBC) with PBKDF2 key derivation from a pre-shared secret before entering the Tor network.
 - **Passphrase-Protected Secret** -- The shared secret can be encrypted at rest using a user-chosen passphrase (AES-256-CBC, 100,000 PBKDF2 iterations). Existing plaintext secrets are automatically detected with an offer to migrate.
 - **Low Bandwidth** -- Opus codec at 16kbps, 8kHz mono. A typical 10-second voice message is under 20KB, well within Tor's capacity.
+- **QR Code Sharing** -- Option 3 can display your `.onion` address as a scannable QR code in the terminal. If `qrencode` is not installed, you are prompted to install it. The QR code renders on the alternate screen buffer and is destroyed when dismissed.
+- **Opaque Temporary Files** -- All temp files use generic `.tmp` extensions and random hex identifiers. No file type or timing metadata is leaked to the filesystem.
 - **Cross-Platform** -- Runs on standard Linux distributions and Android via Termux. Platform-specific audio backends are handled transparently.
 - **No Root Required** -- PTT input uses terminal raw mode. No special permissions or kernel modules needed.
 - **Single Script** -- One Bash file. No build system, no runtime, no framework.
@@ -143,7 +145,7 @@ Both parties must have Tor running and the same shared secret configured before 
 ```
  1  Listen for calls          Wait for an incoming connection
  2  Call an onion address     Connect to a remote .onion endpoint
- 3  Show my onion address     Display your current .onion address
+ 3  Show my onion address     Display your .onion address (with optional QR code)
  4  Set shared secret         Configure the pre-shared encryption key
  5  Test audio (loopback)     Record and play back audio locally
  6  Show status               Display Tor, secret, and connection status
@@ -324,11 +326,7 @@ If the script hangs after pressing Q, press Ctrl+C to force cleanup and return t
 
 [MIRROR V1.1.0](https://bin.disroot.org/?0b0da14f31521b3a#B1c23J8xFoZZKErvGG28PgbtfgtMUcDABWmQEoSZfXgh)
 
----
-
-Donate Monero 
-
-49UzKejMqAeNGEG3C7cY99SUdxUjmWPqaa3s2k986WdcYz2hNfRUmDwa92odn9NLBdhwoWnx3hno5UEe1xYVb8ps92h3Qpt
+[MIRROR V1.1.1](https://bin.disroot.org/?d8e2d4f0300eb5af#9Y1C8CkcH9jAmv1fh4GZs1yYpJmWCG5xG3SvDYdwnJam)
 
 ---
 
