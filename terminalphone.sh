@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION
 #=============================================================================
 APP_NAME="TerminalPhone"
-VERSION="1.1.0"
+VERSION="1.1.1"
 BASE_DIR="$(dirname "$(readlink -f "$0")")"
 DATA_DIR="$BASE_DIR/.terminalphone"
 TOR_DIR="$DATA_DIR/tor_data"
@@ -150,7 +150,7 @@ log_err() {
 }
 
 uid() {
-    echo "$(date +%s%N 2>/dev/null || date +%s)_${RANDOM}"
+    head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n'
 }
 
 load_config() {
@@ -624,7 +624,7 @@ audio_record() {
     local duration="${2:-$CHUNK_DURATION}"
 
     if [ $IS_TERMUX -eq 1 ]; then
-        local tmp_rec="$AUDIO_DIR/tmrec_$(uid).m4a"
+        local tmp_rec="$AUDIO_DIR/tmrec_$(uid).tmp"
         rm -f "$tmp_rec"
         termux-microphone-record -l "$((duration + 1))" -f "$tmp_rec" &>/dev/null
         sleep "$duration"
@@ -647,12 +647,12 @@ start_recording() {
     local _id=$(uid)
 
     if [ $IS_TERMUX -eq 1 ]; then
-        REC_FILE="$AUDIO_DIR/msg_${_id}.m4a"
+        REC_FILE="$AUDIO_DIR/msg_${_id}.tmp"
         rm -f "$REC_FILE"
         termux-microphone-record -l 120 -f "$REC_FILE" &>/dev/null &
         REC_PID=$!
     else
-        REC_FILE="$AUDIO_DIR/msg_${_id}.raw"
+        REC_FILE="$AUDIO_DIR/msg_${_id}.tmp"
         arecord -f S16_LE -r "$SAMPLE_RATE" -c 1 -t raw -q "$REC_FILE" 2>/dev/null &
         REC_PID=$!
     fi
@@ -704,9 +704,9 @@ apply_voice_effect() {
 # Encodes, encrypts, base64-encodes, and writes to fd 4
 stop_and_send() {
     local _id=$(uid)
-    local raw_file="$AUDIO_DIR/tx_${_id}.raw"
-    local opus_file="$AUDIO_DIR/tx_${_id}.opus"
-    local enc_file="$AUDIO_DIR/tx_enc_${_id}.opus"
+    local raw_file="$AUDIO_DIR/tx_${_id}.tmp"
+    local opus_file="$AUDIO_DIR/tx_o_${_id}.tmp"
+    local enc_file="$AUDIO_DIR/tx_e_${_id}.tmp"
 
     # Stop the recording
     if [ $IS_TERMUX -eq 1 ]; then
@@ -731,7 +731,7 @@ stop_and_send() {
 
     # Apply voice effect if set
     if [ -s "$raw_file" ] && [ "$VOICE_EFFECT" != "none" ]; then
-        local fx_file="$AUDIO_DIR/tx_fx_${_id}.raw"
+        local fx_file="$AUDIO_DIR/tx_fx_${_id}.tmp"
         if apply_voice_effect "$raw_file" "$fx_file"; then
             mv "$fx_file" "$raw_file"
         else
@@ -855,7 +855,7 @@ cleanup_call() {
     rm -f "$DATA_DIR/run/vol_ptt_trigger_$$"
 
     # Clean temp audio files
-    rm -f "$AUDIO_DIR"/*.opus "$AUDIO_DIR"/*.bin "$AUDIO_DIR"/*.txt "$AUDIO_DIR"/*.wav 2>/dev/null || true
+    rm -f "$AUDIO_DIR"/*.tmp 2>/dev/null || true
 
     # Reset state variables
     CALL_ACTIVE=0
@@ -1337,8 +1337,8 @@ in_call_session() {
                         # Encrypted text message received
                         local msg_b64="${line#MSG:}"
                         local _mid=$(uid)
-                        local msg_enc="$AUDIO_DIR/msg_enc_${_mid}.bin"
-                        local msg_dec="$AUDIO_DIR/msg_dec_${_mid}.txt"
+                        local msg_enc="$AUDIO_DIR/msg_enc_${_mid}.tmp"
+                        local msg_dec="$AUDIO_DIR/msg_dec_${_mid}.tmp"
                         echo "$msg_b64" | base64 -d > "$msg_enc" 2>/dev/null || true
                         if [ -s "$msg_enc" ]; then
                             if decrypt_file "$msg_enc" "$msg_dec" 2>/dev/null; then
@@ -1353,8 +1353,8 @@ in_call_session() {
                         # Extract base64 data, decode, decrypt, play
                         local b64_data="${line#AUDIO:}"
                         local _rid=$(uid)
-                        local enc_file="$AUDIO_DIR/recv_enc_${_rid}.opus"
-                        local dec_file="$AUDIO_DIR/recv_dec_${_rid}.opus"
+                        local enc_file="$AUDIO_DIR/recv_enc_${_rid}.tmp"
+                        local dec_file="$AUDIO_DIR/recv_dec_${_rid}.tmp"
 
                         echo "$b64_data" | base64 -d > "$enc_file" 2>/dev/null || true
                         if [ -s "$enc_file" ]; then
@@ -1493,8 +1493,8 @@ in_call_session() {
             if [ -n "$chat_msg" ]; then
                 # Encrypt and send
                 local _cid=$(uid)
-                local chat_plain="$AUDIO_DIR/chat_${_cid}.txt"
-                local chat_enc="$AUDIO_DIR/chat_enc_${_cid}.bin"
+                local chat_plain="$AUDIO_DIR/chat_${_cid}.tmp"
+                local chat_enc="$AUDIO_DIR/chat_enc_${_cid}.tmp"
                 echo -n "$chat_msg" > "$chat_plain"
                 encrypt_file "$chat_plain" "$chat_enc" 2>/dev/null
                 if [ -s "$chat_enc" ]; then
@@ -1578,7 +1578,7 @@ test_audio() {
     # Step 1: Record
     echo -ne "  ${YELLOW}● Recording for 3 seconds... speak now!${NC} "
     local _tid=$(uid)
-    local raw_file="$AUDIO_DIR/test_${_tid}.raw"
+    local raw_file="$AUDIO_DIR/test_${_tid}.tmp"
     audio_record "$raw_file" 3
     echo -e "${GREEN}done${NC}"
 
@@ -1593,7 +1593,7 @@ test_audio() {
 
     # Step 2: Encode with Opus
     echo -ne "  ${YELLOW}● Encoding with Opus at ${OPUS_BITRATE}kbps...${NC} "
-    local opus_file="$AUDIO_DIR/test_${_tid}.opus"
+    local opus_file="$AUDIO_DIR/test_${_tid}.tmp"
     opusenc --raw --raw-rate "$SAMPLE_RATE" --raw-chan 1 \
         --bitrate "$OPUS_BITRATE" --framesize "$OPUS_FRAMESIZE" \
         --speech --quiet \
@@ -1613,8 +1613,8 @@ test_audio() {
     # Step 3: Encrypt + Decrypt round-trip (if secret is set)
     if [ -n "$SHARED_SECRET" ]; then
         echo -ne "  ${YELLOW}● Encrypting and decrypting...${NC} "
-        local enc_file="$AUDIO_DIR/test_enc_${_tid}.opus"
-        local dec_file="$AUDIO_DIR/test_dec_${_tid}.opus"
+        local enc_file="$AUDIO_DIR/test_enc_${_tid}.tmp"
+        local dec_file="$AUDIO_DIR/test_dec_${_tid}.tmp"
         encrypt_file "$opus_file" "$enc_file"
         decrypt_file "$enc_file" "$dec_file"
 
@@ -1632,7 +1632,7 @@ test_audio() {
     play_chunk "$opus_file"
     echo -e "${GREEN}done${NC}"
 
-    rm -f "$raw_file" "$opus_file" "$AUDIO_DIR/test_dec_${_tid}.opus" 2>/dev/null
+    rm -f "$raw_file" "$opus_file" "$AUDIO_DIR/test_dec_${_tid}.tmp" 2>/dev/null
 
     echo -e "\n  ${GREEN}${BOLD}Audio test complete!${NC}"
     echo -e "  ${DIM}If you heard your voice, the pipeline is working.${NC}\n"
@@ -2285,6 +2285,55 @@ main_menu() {
                 onion=$(get_onion)
                 if [ -n "$onion" ]; then
                     echo -e "\n  ${BOLD}${GREEN}Your address:${NC} ${WHITE}${BOLD}${onion}${NC}\n"
+
+                    # QR code generation
+                    if check_dep qrencode; then
+                        echo -ne "  ${BOLD}Show QR code? [Y/n]: ${NC}"
+                        read -r _qr_show
+                        if [ "$_qr_show" != "n" ] && [ "$_qr_show" != "N" ]; then
+                            tput smcup 2>/dev/null || true
+                            clear
+                            echo -e "\n  ${BOLD}${GREEN}Your address:${NC} ${WHITE}${BOLD}${onion}${NC}\n"
+                            qrencode -t ANSIUTF8 "$onion"
+                            echo ""
+                            echo -ne "  ${DIM}Press Enter to dismiss QR code...${NC}"
+                            read -r
+                            tput rmcup 2>/dev/null || true
+                        fi
+                    else
+                        echo -ne "  ${BOLD}Install QR code generator (qrencode) to display a scannable QR? [Y/n]: ${NC}"
+                        read -r _qr_install
+                        if [ "$_qr_install" != "n" ] && [ "$_qr_install" != "N" ]; then
+                            local SUDO="sudo"
+                            if [ $IS_TERMUX -eq 1 ]; then
+                                SUDO=""
+                                pkg install -y libqrencode 2>/dev/null
+                            elif check_dep apt-get; then
+                                $SUDO apt-get install -y qrencode 2>/dev/null
+                            elif check_dep dnf; then
+                                $SUDO dnf install -y qrencode 2>/dev/null
+                            elif check_dep pacman; then
+                                $SUDO pacman -S --noconfirm qrencode 2>/dev/null
+                            else
+                                log_err "No supported package manager found. Install qrencode manually."
+                            fi
+
+                            if check_dep qrencode; then
+                                log_ok "qrencode installed successfully!"
+                                sleep 1
+                                tput smcup 2>/dev/null || true
+                                clear
+                                echo -e "\n  ${BOLD}${GREEN}Your address:${NC} ${WHITE}${BOLD}${onion}${NC}\n"
+                                qrencode -t ANSIUTF8 "$onion"
+                                echo ""
+                                echo -ne "  ${DIM}Press Enter to dismiss QR code...${NC}"
+                                read -r
+                                tput rmcup 2>/dev/null || true
+                            else
+                                log_err "qrencode installation failed."
+                            fi
+                        fi
+                    fi
                 else
                     echo -e "\n  ${YELLOW}Tor hidden service not running. Start Tor first (option 8).${NC}\n"
                 fi
