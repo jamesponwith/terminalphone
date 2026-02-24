@@ -102,6 +102,18 @@ Tor Settings submenu. New option 8 in Settings opens a Tor Settings submenu. Cur
 
 GeoIP auto-detection. The torrc now includes explicit GeoIPFile and GeoIPv6File directives, resolved automatically from Termux ($PREFIX/share/tor), standard Linux (/usr/share/tor), or local builds (/usr/local/share/tor).
 
-I plan on expanding this submenu to take advantage and manage all the tor configurations available in the torrc. Will potentially migrage the snoflake menu to this submenu as well.
+I plan on expanding this submenu to take advantage and manage all the tor configurations available in the torrc. Will potentially migrate the snowflake menu to this submenu as well.
 
 Improved the listen for calls option. You can now stop listening and it will bring you back to the menu, or you can start the autolistener. Previously you could only stop with ctrl+c which would also kill tor and the application entirely.
+
+Version 1.1.3 2-24-26
+
+Exclude countries from Tor circuits. New option in Settings → Tor Settings → Exclude countries. Presets for Five Eyes (US, GB, CA, AU, NZ), Nine Eyes (+ DK, FR, NL, NO), and Fourteen Eyes (+ DE, BE, IT, SE, ES) intelligence alliances. Custom country codes can also be entered manually. Uses ExcludeNodes with StrictNodes in the torrc. The current exclusion list is displayed in the Tor Settings status line. Requires a Tor restart after changing.
+
+HMAC protocol authentication. New optional feature in Settings → Security → HMAC authentication. When enabled, every protocol message (voice, text, hangup, and all control signals) is signed with HMAC-SHA256 derived from the shared secret. A random nonce is included with each message so that identical commands produce a unique signature every time. Seen nonces are tracked per call and duplicates are rejected, preventing replay attacks. The HMAC setting is frozen at call start so both send and receive paths always agree; mid-call changes take effect on the next call. Off by default for backwards compatibility. Both parties must enable HMAC for calls to work. Not compatible with versions prior to 1.1.3.
+
+Security submenu. New option 7 in Settings opens a Security submenu. Contains the encryption cipher configuration (moved from main settings) and the HMAC authentication toggle.
+
+Snowflake bridge moved to Tor Settings submenu (option 3) from the main Settings menu.
+
+Settings menu reorganized. Encryption cipher and Snowflake moved to submenus. Menu options renumbered accordingly.
