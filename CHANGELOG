@@ -174,3 +174,6 @@ Option to record a custom 2-second chime using the device microphone, with a 3-2
 Custom recordings are saved to the data directory. 
 
 Settings menu renumbered: Tor settings moved to option 7, Security to option 8.
+
+*Notes* it looks like enabling chime while in a call doesnot enable until next call. will work on a fix.
+for now enable before calling.
