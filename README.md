@@ -38,6 +38,8 @@ TerminalPhone is a single, self-contained Bash script that provides anonymous, e
 - **Auto-Listen** -- When enabled, a background listener starts automatically when Tor boots. Incoming calls are detected and accepted from the main menu without needing to manually select "Listen for calls". After a call ends, the listener restarts.
 - **Configurable PTT Key** -- Change the push-to-talk key from the default spacebar to any key via the Settings menu.
 - **Message Stats** -- The call screen displays the encrypted payload size for sent and received messages, updated in-place.
+- **Remote PTT Status** -- The call screen shows a static indicator for the remote party's state: "Idle" (green) or "● Recording" (red). Resets immediately when audio data arrives, before playback begins.
+- **PTT Chime** -- Optional notification sound when the remote party starts recording. Five built-in presets (tone, double, chirp, ding, click) generated with sox, plus the ability to record a custom 2-second chime. Configurable via Settings.
 - **Connecting Animation** -- When calling a remote address, a cycling animation plays until the call interface loads.
 - **Voice Changer** -- Apply voice effects to outgoing audio. Includes 6 presets (deep, high, robot, echo, whisper) and a fully configurable custom mode with pitch shift, overdrive, flanger, echo, highpass filter, and tremolo. Effects are processed using sox before Opus encoding.
 - **Volume PTT (Termux)** -- Experimental mode that lets you double-tap the Volume Down button to toggle recording, even when Termux is in the background. Requires `jq` (installed on demand). Volume is automatically restored after each trigger.
@@ -45,7 +47,7 @@ TerminalPhone is a single, self-contained Bash script that provides anonymous, e
 - **End-to-End Encryption** -- All audio and text is encrypted using a configurable cipher (default: AES-256-CBC) with PBKDF2 key derivation from a pre-shared secret before entering the Tor network.
 - **Passphrase-Protected Secret** -- The shared secret can be encrypted at rest using a user-chosen passphrase (AES-256-CBC, 100,000 PBKDF2 iterations). Existing plaintext secrets are automatically detected with an offer to migrate.
 - **Low Bandwidth** -- Opus codec at 16kbps, 8kHz mono. A typical 10-second voice message is under 20KB, well within Tor's capacity.
-- **QR Code Sharing** -- Option 3 can display your `.onion` address as a scannable QR code in the terminal. If `qrencode` is not installed, you are prompted to install it. The QR code renders on the alternate screen buffer and is destroyed when dismissed.
+- **QR Code Sharing** -- Option 3 can display your `.onion` address as a scannable QR code in the terminal. If `qrencode` is not installed, you are prompted to install it. The QR code renders on the alternate screen buffer and is destroyed when dismissed. A note warns that some QR scanners auto-prepend `http://`; this prefix is automatically stripped when dialing.
 - **Opaque Temporary Files** -- All temp files use generic `.tmp` extensions and random hex identifiers. No file type or timing metadata is leaked to the filesystem.
 - **Circuit Hop Display** -- Opt-in display of your Tor circuit path during calls, showing relay names and full country names. Auto-refreshes every 60 seconds. Configurable via Settings → Tor Settings.
 - **Exclude Countries** -- Exclude specific countries from your Tor circuits. Presets for Five Eyes, Nine Eyes, and Fourteen Eyes alliances, or enter custom country codes. Uses `ExcludeNodes` with `StrictNodes` in the torrc.
@@ -157,7 +159,7 @@ Both parties must have Tor running and the same shared secret configured before 
  9  Stop Tor                  Stop the Tor process
 10  Restart Tor               Stop and restart Tor
 11  Rotate onion address      Generate a new .onion address (destroys the old one)
-12  Settings                  Configure Opus quality, Snowflake, auto-listen, PTT key, voice changer, security, Tor settings
+12  Settings                  Configure Opus quality, PTT chime, Snowflake, auto-listen, PTT key, voice changer, security, Tor settings
  0  Quit                      Stop Tor and exit
 ```
 
@@ -284,6 +286,7 @@ Default audio parameters (defined at the top of the script):
 | `VOL_PTT` | 0 | Volume-down double-tap PTT, Termux only (experimental) |
 | `EXCLUDE_NODES` | (empty) | Tor ExcludeNodes country list (e.g. `{US},{GB}`) |
 | `HMAC_AUTH` | 0 | HMAC-sign all protocol messages (optional, both sides must match) |
+| `PTT_CHIME` | off | PTT notification chime preset (off, tone, double, chirp, ding, click, custom) |
 | `SAMPLE_RATE` | 8000 | Audio sample rate in Hz |
 | `CHUNK_DURATION` | 1 | Duration for audio test chunks in seconds |
 
@@ -305,6 +308,9 @@ Confirm that both parties are using the same shared secret. Mismatched secrets w
 
 **Snowflake bridge is slow to connect:**
 Snowflake routes traffic through WebRTC proxies, which adds extra bootstrapping time. It is normal for Tor to take 30--60 seconds (or more) to reach 100% when Snowflake is enabled. The script will display a patience notice during bootstrap.
+
+**First Tor bootstrap is slow:**
+On first launch, Tor must download the full network consensus from scratch, which can take a minute or two. The script detects this and displays a notice. The bootstrap timeout is automatically extended from 120 to 300 seconds on first run. Subsequent launches use cached consensus data and are much faster.
 
 **Hang up does not return to menu:**
 If the script hangs after pressing Q, press Ctrl+C to force cleanup and return to the shell.
@@ -338,6 +344,8 @@ If the script hangs after pressing Q, press Ctrl+C to force cleanup and return t
 [MIRROR V1.1.2](https://bin.disroot.org/?b1059616f880925f#8ef2oscZXUkPAsJZwGfWvLPQagVAk5GgW4DyssmLvQpG)
 
 [MIRROR V1.1.3](https://bin.disroot.org/?b02658801518aaa7#JE6CsBLWUwAnTdBqeHgeXL7QF5UExgi9rnygcfyMZjCJ)
+
+[MIRROR V1.1.4](https://bin.disroot.org/?d31248fc44c287a0#HQELFWFEMpM9kfTZSGDXTdGFMVKTejox5CajF9Vm4Www)
 
 ---
 
