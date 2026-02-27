@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION
 #=============================================================================
 APP_NAME="TerminalPhone"
-VERSION="1.1.3"
+VERSION="1.1.4"
 BASE_DIR="$(dirname "$(readlink -f "$0")")"
 DATA_DIR="$BASE_DIR/.terminalphone"
 TOR_DIR="$DATA_DIR/tor_data"
@@ -47,6 +47,7 @@ SHOW_CIRCUIT=0        # Show Tor circuit hops in call header (off by default)
 TOR_CONTROL_PORT=9051 # Tor control port (used when SHOW_CIRCUIT=1)
 EXCLUDE_NODES=""      # Tor ExcludeNodes (comma-separated country codes, e.g. {US},{GB})
 HMAC_AUTH=0           # HMAC-sign all protocol messages (off by default)
+PTT_CHIME="off"       # PTT notification chime (off, tone, double, chirp, ding, click, custom)
 
 # Custom voice effect parameters (used when VOICE_EFFECT=custom)
 VOICE_PITCH=0         # Pitch shift in cents (-600 to +600, 0=off)
@@ -242,6 +243,7 @@ VOL_PTT=$VOL_PTT
 SHOW_CIRCUIT=$SHOW_CIRCUIT
 EXCLUDE_NODES="$EXCLUDE_NODES"
 HMAC_AUTH=$HMAC_AUTH
+PTT_CHIME="$PTT_CHIME"
 EOF
 }
 
@@ -466,6 +468,10 @@ start_tor() {
     > "$tor_log"
 
     log_info "Starting Tor..."
+    if [ ! -d "$TOR_DIR/data" ] && [ ! -f "$ONION_FILE" ]; then
+        echo -e "  ${DIM}First bootstrap detected — Tor needs to download network consensus.${NC}"
+        echo -e "  ${DIM}This is a one-time process and may take a minute or two.${NC}"
+    fi
     if [ "$SNOWFLAKE_ENABLED" -eq 1 ]; then
         echo -e "  ${DIM}Snowflake bridge enabled — this may take longer than usual, please be patient.${NC}"
     fi
@@ -476,6 +482,9 @@ start_tor() {
     # Monitor bootstrap progress from the log
     local waited=0
     local timeout=120
+    if [ ! -d "$TOR_DIR/data" ] && [ ! -f "$ONION_FILE" ]; then
+        timeout=300
+    fi
     local last_pct=""
 
     while [ $waited -lt $timeout ]; do
@@ -1332,6 +1341,10 @@ call_remote() {
         return 1
     fi
 
+    # Strip http(s):// prefix (some QR scanners auto-prepend it)
+    remote_onion="${remote_onion#http://}"
+    remote_onion="${remote_onion#https://}"
+
     # Append .onion if not present
     if [[ "$remote_onion" != *.onion ]]; then
         remote_onion="${remote_onion}.onion"
@@ -1491,6 +1504,10 @@ draw_call_header() {
     RECV_INFO_ROW=$_r
     _r=$((_r + 1))
 
+    echo -e "  ${DIM}Remote:     ${NC}${GREEN}Idle${NC}" >&2
+    REMOTE_STATUS_ROW=$_r
+    _r=$((_r + 1))
+
     echo "" >&2; _r=$((_r + 1))
 
     # Static status bar
@@ -1639,12 +1656,18 @@ in_call_session() {
                 case "$line" in
                     PTT_START)
                         printf '\033[s' >&2
-                        printf '\033[%d;1H\033[K' "$STATUS_ROW" >&2
-                        printf '  \033[42;1;37m REMOTE TALKING \033[0m   ' >&2
+                        printf '\033[%d;1H\033[K' "$REMOTE_STATUS_ROW" >&2
+                        printf '  \033[2mRemote:     \033[0m\033[1;31m● Recording\033[0m' >&2
                         printf '\033[u' >&2
+                        if [ "$PTT_CHIME" != "off" ]; then
+                            play_chime &
+                        fi
                         ;;
                     PTT_STOP)
-                        # silent — Last recv row provides feedback
+                        printf '\033[s' >&2
+                        printf '\033[%d;1H\033[K' "$REMOTE_STATUS_ROW" >&2
+                        printf '  \033[2mRemote:     \033[0m\033[1;32mIdle\033[0m' >&2
+                        printf '\033[u' >&2
                         ;;
                     PING)
                         # silent — no display update
@@ -1714,6 +1737,8 @@ in_call_session() {
                                 printf '\033[s' >&2
                                 printf '\033[%d;1H\033[K' "$RECV_INFO_ROW" >&2
                                 printf '  \033[2mLast recv:  \033[0m\033[1;37m%s\033[0m' "$_recv_info" >&2
+                                printf '\033[%d;1H\033[K' "$REMOTE_STATUS_ROW" >&2
+                                printf '  \033[2mRemote:     \033[0m\033[1;32mIdle\033[0m' >&2
                                 printf '\033[u' >&2
 
                                 play_chunk "$dec_file" 2>/dev/null || true
@@ -1768,6 +1793,7 @@ in_call_session() {
                     printf '\033[s' >&2; printf '\033[%d;1H\033[K' "$STATUS_ROW" >&2
                     printf '  \033[41;1;37m \u25cf RECORDING \033[0m \033[2m[SPACE]=Send\033[0m        ' >&2
                     printf '\033[u' >&2
+                    proto_send "PTT_START"
                     start_recording
                 else
                     ptt_active=0
@@ -1789,6 +1815,7 @@ in_call_session() {
                     printf '  \033[41;1;37;5m \u25cf RECORDING \033[0m                ' >&2
                     printf '\033[u' >&2
                     stty time 5  # longer timeout to span keyboard repeat delay
+                    proto_send "PTT_START"
                     start_recording
                 fi
             fi
@@ -2037,6 +2064,111 @@ show_status() {
 }
 
 #=============================================================================
+# PTT CHIME
+#=============================================================================
+
+CUSTOM_CHIME_FILE="$DATA_DIR/custom_chime.tmp"
+
+play_chime() {
+    case "$PTT_CHIME" in
+        tone)   play -qn synth 0.15 sine 880 vol 0.3 2>/dev/null ;;
+        double) play -qn synth 0.08 sine 880 vol 0.3 2>/dev/null; play -qn synth 0.08 sine 1100 vol 0.3 2>/dev/null ;;
+        chirp)  play -qn synth 0.2 sine 600:1200 vol 0.3 2>/dev/null ;;
+        ding)   play -qn synth 0.3 sine 1047 fade l 0 0.3 0.2 vol 0.3 2>/dev/null ;;
+        click)  play -qn synth 0.03 noise vol 0.2 2>/dev/null ;;
+        custom)
+            if [ -f "$CUSTOM_CHIME_FILE" ]; then
+                play -q -t raw -r "$SAMPLE_RATE" -e signed -b 16 -c 1 "$CUSTOM_CHIME_FILE" 2>/dev/null
+            else
+                play -qn synth 0.15 sine 880 vol 0.3 2>/dev/null
+            fi
+            ;;
+    esac
+}
+
+settings_chime() {
+    while true; do
+        clear
+        echo -e "\n${BOLD}${CYAN}═══ PTT Chime ═══${NC}\n"
+        echo -e "  ${DIM}Plays a notification sound when the remote party starts recording.${NC}\n"
+
+        local current="$PTT_CHIME"
+        local custom_status=""
+        if [ -f "$CUSTOM_CHIME_FILE" ]; then
+            custom_status=" ${GREEN}(recorded)${NC}"
+        fi
+
+        echo -e "  ${BOLD}${WHITE}1${NC} ${CYAN}│${NC} Tone        ${DIM}— short beep${NC}$([ "$current" = "tone" ] && echo "  ${GREEN}◄${NC}")"
+        echo -e "  ${BOLD}${WHITE}2${NC} ${CYAN}│${NC} Double      ${DIM}— two quick beeps${NC}$([ "$current" = "double" ] && echo "  ${GREEN}◄${NC}")"
+        echo -e "  ${BOLD}${WHITE}3${NC} ${CYAN}│${NC} Chirp       ${DIM}— ascending sweep${NC}$([ "$current" = "chirp" ] && echo "  ${GREEN}◄${NC}")"
+        echo -e "  ${BOLD}${WHITE}4${NC} ${CYAN}│${NC} Ding        ${DIM}— bell with decay${NC}$([ "$current" = "ding" ] && echo "  ${GREEN}◄${NC}")"
+        echo -e "  ${BOLD}${WHITE}5${NC} ${CYAN}│${NC} Click       ${DIM}— short percussive${NC}$([ "$current" = "click" ] && echo "  ${GREEN}◄${NC}")"
+        echo -e "  ${BOLD}${WHITE}6${NC} ${CYAN}│${NC} Custom${custom_status}$([ "$current" = "custom" ] && echo "  ${GREEN}◄${NC}")"
+        echo -e "  ${BOLD}${WHITE}7${NC} ${CYAN}│${NC} Record custom chime ${DIM}(2 seconds)${NC}"
+        echo -e "  ${BOLD}${WHITE}8${NC} ${CYAN}│${NC} ${DIM}Off${NC}$([ "$current" = "off" ] && echo "  ${GREEN}◄${NC}")"
+        echo -e "  ${BOLD}${WHITE}0${NC} ${CYAN}│${NC} ${DIM}Back${NC}"
+        echo ""
+        echo -ne "  ${BOLD}Select: ${NC}"
+        read -r _cc
+
+        case "$_cc" in
+            1) PTT_CHIME="tone";   save_config; log_ok "Chime set to: tone";   play_chime; sleep 1 ;;
+            2) PTT_CHIME="double"; save_config; log_ok "Chime set to: double"; play_chime; sleep 1 ;;
+            3) PTT_CHIME="chirp";  save_config; log_ok "Chime set to: chirp";  play_chime; sleep 1 ;;
+            4) PTT_CHIME="ding";   save_config; log_ok "Chime set to: ding";   play_chime; sleep 1 ;;
+            5) PTT_CHIME="click";  save_config; log_ok "Chime set to: click";  play_chime; sleep 1 ;;
+            6)
+                if [ -f "$CUSTOM_CHIME_FILE" ]; then
+                    PTT_CHIME="custom"
+                    save_config
+                    log_ok "Chime set to: custom"
+                    play_chime
+                    sleep 1
+                else
+                    echo -e "\n  ${YELLOW}No custom chime recorded. Use option 7 to record one.${NC}"
+                    sleep 2
+                fi
+                ;;
+            7)
+                echo -e "\n  ${BOLD}Recording a 2-second custom chime...${NC}"
+                echo -e "  ${DIM}Play a sound near the microphone after the countdown.${NC}\n"
+                sleep 1
+                echo -ne "  3..."
+                sleep 1
+                echo -ne " 2..."
+                sleep 1
+                echo -e " 1... ${RED}${BOLD}● REC${NC}"
+                audio_record "$CUSTOM_CHIME_FILE" 2
+                if [ -s "$CUSTOM_CHIME_FILE" ]; then
+                    log_ok "Custom chime recorded!"
+                    PTT_CHIME="custom"
+                    save_config
+                    echo -e "  ${DIM}Playing back...${NC}"
+                    sleep 0.5
+                    play_chime
+                else
+                    log_err "Recording failed — no audio captured"
+                fi
+                sleep 2
+                ;;
+            0|q|Q)
+                return
+                ;;
+            8)
+                PTT_CHIME="off"
+                save_config
+                log_ok "PTT chime disabled"
+                sleep 1
+                ;;
+            *)
+                echo -e "\n  ${RED}Invalid choice${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+#=============================================================================
 # SETTINGS MENU
 #=============================================================================
 
@@ -2080,6 +2212,12 @@ settings_menu() {
             hmac_label="${GREEN}enabled${NC}"
         fi
         echo -e "  ${DIM}HMAC auth:            ${NC}${hmac_label}"
+
+        local chime_label="${RED}off${NC}"
+        if [ "$PTT_CHIME" != "off" ]; then
+            chime_label="${GREEN}${PTT_CHIME}${NC}"
+        fi
+        echo -e "  ${DIM}PTT chime:            ${NC}${chime_label}"
         echo ""
 
         echo -e "  ${BOLD}${WHITE}1${NC} ${CYAN}│${NC} Change Opus encoding quality"
@@ -2089,8 +2227,9 @@ settings_menu() {
         if [ $IS_TERMUX -eq 1 ]; then
             echo -e "  ${BOLD}${WHITE}5${NC} ${CYAN}│${NC} Volume PTT ${DIM}(double-tap Vol Down to talk, experimental)${NC}"
         fi
-        echo -e "  ${BOLD}${WHITE}6${NC} ${CYAN}│${NC} Tor settings"
-        echo -e "  ${BOLD}${WHITE}7${NC} ${CYAN}│${NC} Security"
+        echo -e "  ${BOLD}${WHITE}6${NC} ${CYAN}│${NC} PTT chime ${DIM}(notification sound when remote starts recording)${NC}"
+        echo -e "  ${BOLD}${WHITE}7${NC} ${CYAN}│${NC} Tor settings"
+        echo -e "  ${BOLD}${WHITE}8${NC} ${CYAN}│${NC} Security"
         echo -e "  ${BOLD}${WHITE}0${NC} ${CYAN}│${NC} ${DIM}Back to main menu${NC}"
         echo ""
         echo -ne "  ${BOLD}Select: ${NC}"
@@ -2168,8 +2307,9 @@ settings_menu() {
                     sleep 1
                 fi
                 ;;
-            6) settings_tor ;;
-            7) settings_security ;;
+            6) settings_chime ;;
+            7) settings_tor ;;
+            8) settings_security ;;
             0|q|Q) return ;;
             *)
                 echo -e "\n  ${RED}Invalid choice${NC}"
@@ -2915,6 +3055,7 @@ main_menu() {
                             echo -e "\n  ${BOLD}${GREEN}Your address:${NC} ${WHITE}${BOLD}${onion}${NC}\n"
                             qrencode -t ANSIUTF8 "$onion"
                             echo ""
+                            echo -e "  ${DIM}Note: Some QR scanners auto-prepend http:// — this will be stripped when dialing.${NC}"
                             echo -ne "  ${DIM}Press Enter to dismiss QR code...${NC}"
                             read -r
                             tput rmcup 2>/dev/null || true
@@ -2945,6 +3086,7 @@ main_menu() {
                                 echo -e "\n  ${BOLD}${GREEN}Your address:${NC} ${WHITE}${BOLD}${onion}${NC}\n"
                                 qrencode -t ANSIUTF8 "$onion"
                                 echo ""
+                                echo -e "  ${DIM}Note: Some QR scanners auto-prepend http:// — this will be stripped when dialing.${NC}"
                                 echo -ne "  ${DIM}Press Enter to dismiss QR code...${NC}"
                                 read -r
                                 tput rmcup 2>/dev/null || true
@@ -3001,7 +3143,6 @@ main_menu() {
             0|q|Q)
                 echo -e "\n${GREEN}Goodbye!${NC}"
                 stop_tor
-                cleanup
                 exit 0
                 ;;
             *)
@@ -3046,6 +3187,8 @@ case "${1:-}" in
         load_config
         if [ -n "${2:-}" ]; then
             remote_onion="$2"
+            remote_onion="${remote_onion#http://}"
+            remote_onion="${remote_onion#https://}"
             if [[ "$remote_onion" != *.onion ]]; then
                 remote_onion="${remote_onion}.onion"
             fi
