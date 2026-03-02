@@ -177,3 +177,39 @@ Settings menu renumbered: Tor settings moved to option 7, Security to option 8.
 
 *Notes* it looks like enabling chime while in a call doesnot enable until next call. will work on a fix.
 for now enable before calling.
+
+Version 1.1.5 3-2-26
+
+Relay mode (group bridge). New option 13 on the main menu and `relay` CLI command. 
+The relay acts as a dumb bridge for N anonymous callers. It accepts multiple connections using socat with fork, 
+and each connection spawns a handler script that broadcasts audio and chat to all other connected callers via named pipes. 
+The relay itself never decrypts any content — it has no shared secret and requires no audio hardware. 
+Only AUDIO:, MSG:, and PING messages are forwarded; all control signals (HANGUP, CIPHER:, ID:, PTT_START, PTT_STOP) are filtered out.
+
+Relay protocol. The relay sends a RELAY:1 greeting when a client connects, allowing automatic detection of group mode. 
+Clients that detect RELAY:1 switch to a relay-aware call interface: the call header shows "Mode: RELAY (group call)" 
+instead of a remote cipher, the Remote status row becomes a live "Group: N callers" counter, and HANGUP messages are ignored 
+so one caller leaving does not disconnect everyone else.
+
+Live group count. The relay broadcasts GROUP:N to all clients whenever a caller joins or leaves. 
+The count updates in real time on each client's call header. Relay protocol messages (RELAY: and GROUP:) are handled 
+before HMAC verification since they originate from the relay and are never signed.
+
+Relay operator dashboard. The relay's status display shows live metrics: connected caller count, uptime, 
+and total data throughput (In/Out) formatted as B, KB, or MB. Each handler tracks its own byte counters 
+via per-client stats files that are summed by the monitoring loop.
+
+Zero-knowledge architecture. The relay stores nothing to disk — audio flows through kernel pipe buffers (FIFOs) 
+that exist only in memory. When the relay stops, all temporary files (marker files, stats, handler script) are removed. 
+The relay operator has no access to message content, caller identities, or encryption keys.
+
+Single-hop Tor mode. New option 4 in Tor Settings. Reduces the hidden service circuit from 3 hops to 1 hop for lower latency. 
+Tradeoff: the relay operator's IP is visible to the single Tor relay they connect through, completely removing server anonymity. 
+The SOCKS proxy is disabled in this mode (SocksPort 0), preventing outbound calls — only incoming connections are supported. 
+Designed for relay operators who prioritize latency over their own anonymity.
+
+Port configuration. New option 5 in Tor Settings. Configure both the listen port and Tor SOCKS port together. 
+Both ports are validated (1024–65535) and checked to prevent collision. Enables running multiple TerminalPhone instances 
+on the same device with separate Tor processes by assigning unique port pairs to each instance.
+Primary use case: a relay operator who also wants to join their own group call can run the relay on one instance, 
+change the SOCKS port on a second instance, and dial into the relay as a regular caller.
