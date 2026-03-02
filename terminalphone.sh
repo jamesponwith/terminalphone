@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION
 #=============================================================================
 APP_NAME="TerminalPhone"
-VERSION="1.1.4"
+VERSION="1.1.5"
 BASE_DIR="$(dirname "$(readlink -f "$0")")"
 DATA_DIR="$BASE_DIR/.terminalphone"
 TOR_DIR="$DATA_DIR/tor_data"
@@ -47,6 +47,7 @@ SHOW_CIRCUIT=0        # Show Tor circuit hops in call header (off by default)
 TOR_CONTROL_PORT=9051 # Tor control port (used when SHOW_CIRCUIT=1)
 EXCLUDE_NODES=""      # Tor ExcludeNodes (comma-separated country codes, e.g. {US},{GB})
 HMAC_AUTH=0           # HMAC-sign all protocol messages (off by default)
+SINGLE_HOP=0          # Single-hop hidden service (off by default, sacrifices server anonymity for speed)
 PTT_CHIME="off"       # PTT notification chime (off, tone, double, chirp, ding, click, custom)
 
 # Custom voice effect parameters (used when VOICE_EFFECT=custom)
@@ -243,6 +244,7 @@ VOL_PTT=$VOL_PTT
 SHOW_CIRCUIT=$SHOW_CIRCUIT
 EXCLUDE_NODES="$EXCLUDE_NODES"
 HMAC_AUTH=$HMAC_AUTH
+SINGLE_HOP=$SINGLE_HOP
 PTT_CHIME="$PTT_CHIME"
 EOF
 }
@@ -357,13 +359,26 @@ setup_tor() {
     mkdir -p "$TOR_DIR/hidden_service"
     chmod 700 "$TOR_DIR/hidden_service"
 
-    cat > "$TOR_CONF" << EOF
+    if [ "$SINGLE_HOP" -eq 1 ]; then
+        cat > "$TOR_CONF" << EOF
+SocksPort 0
+DataDirectory $TOR_DIR/data
+HiddenServiceNonAnonymousMode 1
+HiddenServiceSingleHopMode 1
+HiddenServiceDir $TOR_DIR/hidden_service
+HiddenServicePort $LISTEN_PORT 127.0.0.1:$LISTEN_PORT
+Log notice file $TOR_DIR/tor.log
+EOF
+        log_info "Single-hop mode: server anonymity DISABLED for lower latency"
+    else
+        cat > "$TOR_CONF" << EOF
 SocksPort $TOR_SOCKS_PORT
 DataDirectory $TOR_DIR/data
 HiddenServiceDir $TOR_DIR/hidden_service
 HiddenServicePort $LISTEN_PORT 127.0.0.1:$LISTEN_PORT
 Log notice file $TOR_DIR/tor.log
 EOF
+    fi
 
     # Locate and add GeoIP files (required for ip-to-country lookups)
     local geoip="" geoip6=""
@@ -1095,6 +1110,8 @@ cleanup_call() {
     rm -f "$NONCE_LOG_FILE"
     rm -f "$DATA_DIR/run/remote_id_$$"
     rm -f "$DATA_DIR/run/remote_cipher_$$"
+    rm -f "$DATA_DIR/run/relay_mode_$$"
+    rm -f "$DATA_DIR/run/group_count_$$"
     rm -f "$DATA_DIR/run/incoming_$$"
     rm -f "$DATA_DIR/run/vol_ptt_trigger_$$"
 
@@ -1398,6 +1415,204 @@ call_remote() {
 }
 
 #=============================================================================
+# RELAY MODE — N-CALLER GROUP BRIDGE
+#=============================================================================
+
+relay_mode() {
+    clear
+    echo -e "\n${BOLD}${CYAN}═══ Relay Mode (Group Bridge) ═══${NC}\n"
+    echo -e "  ${DIM}Your device acts as a dumb relay that bridges multiple${NC}"
+    echo -e "  ${DIM}callers together. It never decrypts anything — all${NC}"
+    echo -e "  ${DIM}callers share a secret between themselves.${NC}"
+    echo ""
+    echo -e "  ${BOLD}${WHITE}How it works:${NC}"
+    echo -e "  ${DIM}• You share your .onion address with all participants${NC}"
+    echo -e "  ${DIM}• Each caller dials your address (option 2 on their end)${NC}"
+    echo -e "  ${DIM}• When anyone sends a message, it is forwarded to all others${NC}"
+    echo -e "  ${DIM}• Works naturally with PTT — one person talks at a time${NC}"
+    echo ""
+    echo -e "  ${BOLD}${WHITE}Privacy:${NC}"
+    echo -e "  ${DIM}• Callers stay anonymous (3-hop circuits on their side)${NC}"
+    echo -e "  ${DIM}• No caller sees another's .onion address — only yours${NC}"
+    echo -e "  ${DIM}• The relay cannot read messages (no shared secret)${NC}"
+    echo -e "  ${DIM}• Enable single-hop mode in Tor Settings for lowest latency${NC}"
+    echo ""
+    echo -e "  ${YELLOW}All callers must use the same shared secret.${NC}"
+    echo -e "  ${YELLOW}The relay operator does NOT need a shared secret.${NC}"
+    echo ""
+    echo -ne "  ${BOLD}Start relay? [Y/n]: ${NC}"
+    read -r _relay_confirm
+    if [ "$_relay_confirm" = "n" ] || [ "$_relay_confirm" = "N" ]; then
+        return
+    fi
+
+    start_tor || return 1
+
+    local relay_dir="$DATA_DIR/relay"
+    mkdir -p "$relay_dir"
+    rm -f "$relay_dir"/* 2>/dev/null
+
+    # Write per-connection handler script
+    cat > "$relay_dir/handler.sh" << 'RELAY_HANDLER_EOF'
+#!/bin/bash
+RELAY_DIR="$1"
+ID="$$"
+OUTFIFO="$RELAY_DIR/out_${ID}.fifo"
+
+mkfifo "$OUTFIFO" 2>/dev/null || exit 1
+touch "$RELAY_DIR/client_${ID}"
+
+# Send relay greeting so clients detect group mode
+printf 'RELAY:1\n'
+
+# Broadcast group count to all connected clients
+broadcast_count() {
+    local count=0
+    for cf in "$RELAY_DIR"/client_*; do
+        [ -f "$cf" ] && count=$((count + 1))
+    done
+    for f in "$RELAY_DIR"/out_*.fifo; do
+        [ -p "$f" ] || continue
+        printf 'GROUP:%s\n' "$count" > "$f" 2>/dev/null &
+    done
+}
+
+# Writer: reads from outbox FIFO, sends to network (stdout)
+# Starts in background — blocks until keepalive writer opens below
+while IFS= read -r msg; do
+    printf '%s\n' "$msg"
+done < "$OUTFIFO" &
+WR_PID=$!
+
+# Keepalive writer — prevents reader EOF when external writers close
+exec 3>"$OUTFIFO"
+
+# Announce updated group size (includes this new caller)
+sleep 0.3
+broadcast_count
+
+# Reader: network (stdin) → broadcast to all other outboxes
+# Only forward audio, chat, pings, and group updates
+BYTES_IN=0
+BYTES_OUT=0
+while IFS= read -r line; do
+    # Track inbound bytes
+    BYTES_IN=$((BYTES_IN + ${#line}))
+    # Strip HMAC wrapper if present (nonce:payload|sig → payload)
+    local_payload="$line"
+    case "$line" in *"|"*) local_payload="${line%|*}"; local_payload="${local_payload#*:}" ;; esac
+    # Filter: only forward AUDIO:, MSG:, PING, and GROUP:
+    case "$local_payload" in
+        AUDIO:*|MSG:*|PING|GROUP:*) ;;
+        *) continue ;;
+    esac
+    for f in "$RELAY_DIR"/out_*.fifo; do
+        [ "$f" = "$OUTFIFO" ] && continue
+        [ -p "$f" ] || continue
+        printf '%s\n' "$line" > "$f" 2>/dev/null &
+        BYTES_OUT=$((BYTES_OUT + ${#line}))
+    done
+    # Write stats periodically (every message)
+    echo "$BYTES_IN $BYTES_OUT" > "$RELAY_DIR/stats_${ID}"
+done
+
+# Client disconnected — cleanup
+exec 3>&-
+kill $WR_PID 2>/dev/null
+wait $WR_PID 2>/dev/null
+rm -f "$OUTFIFO" "$RELAY_DIR/client_${ID}" "$RELAY_DIR/stats_${ID}"
+
+# Broadcast updated count (one fewer)
+broadcast_count
+RELAY_HANDLER_EOF
+    chmod +x "$relay_dir/handler.sh"
+
+    local onion
+    onion=$(get_onion)
+    echo ""
+    echo -e "  ${GREEN}Relay address:${NC} ${BOLD}${WHITE}$onion${NC}"
+    echo -e "  ${DIM}Share this address with all callers.${NC}"
+    echo ""
+
+    # Start socat with fork to accept multiple connections
+    socat "TCP-LISTEN:$LISTEN_PORT,reuseaddr,fork" \
+        "EXEC:bash $relay_dir/handler.sh $relay_dir" &
+    local socat_pid=$!
+
+    log_ok "Relay active — waiting for callers..."
+    echo -e "  ${DIM}[Q] Stop relay${NC}\n"
+
+    local start_time
+    start_time=$(date +%s)
+
+    local _bc_tick=0
+    while kill -0 "$socat_pid" 2>/dev/null; do
+        local count=0
+        for _cf in "$relay_dir"/client_*; do
+            [ -f "$_cf" ] && count=$((count + 1))
+        done
+        local uptime=$(( $(date +%s) - start_time ))
+        local mins=$(( uptime / 60 ))
+        local secs=$(( uptime % 60 ))
+        # Sum data stats from all handlers
+        local total_in=0 total_out=0
+        for _sf in "$relay_dir"/stats_*; do
+            [ -f "$_sf" ] || continue
+            local _si _so
+            read -r _si _so < "$_sf" 2>/dev/null || continue
+            total_in=$((total_in + ${_si:-0}))
+            total_out=$((total_out + ${_so:-0}))
+        done
+        # Format bytes to human-readable
+        local in_display out_display
+        if [ $total_in -ge 1048576 ]; then
+            in_display="$((total_in / 1048576)).$((total_in % 1048576 / 104858))MB"
+        elif [ $total_in -ge 1024 ]; then
+            in_display="$((total_in / 1024))KB"
+        else
+            in_display="${total_in}B"
+        fi
+        if [ $total_out -ge 1048576 ]; then
+            out_display="$((total_out / 1048576)).$((total_out % 1048576 / 104858))MB"
+        elif [ $total_out -ge 1024 ]; then
+            out_display="$((total_out / 1024))KB"
+        else
+            out_display="${total_out}B"
+        fi
+        printf "\r  ${BOLD}Callers:${NC} ${GREEN}%-3s${NC} ${DIM}Uptime: %dm %02ds${NC}  ${DIM}In:${NC} ${WHITE}%-8s${NC} ${DIM}Out:${NC} ${WHITE}%-8s${NC}   " \
+            "$count" "$mins" "$secs" "$in_display" "$out_display" 2>/dev/null
+
+        # Periodic GROUP:N broadcast to all clients (~every 10 seconds)
+        _bc_tick=$((_bc_tick + 1))
+        if [ $((_bc_tick % 5)) -eq 0 ] && [ "$count" -gt 0 ]; then
+            for _bf in "$relay_dir"/out_*.fifo; do
+                [ -p "$_bf" ] || continue
+                printf 'GROUP:%s\n' "$count" > "$_bf" 2>/dev/null &
+            done
+        fi
+
+        local input=""
+        if read -r -t 2 input 2>/dev/null; then
+            case "$input" in
+                q|Q) break ;;
+            esac
+        fi
+    done
+
+    # Cleanup
+    echo ""
+    log_info "Stopping relay..."
+    kill "$socat_pid" 2>/dev/null
+    # Kill forked handler processes
+    pkill -P "$socat_pid" 2>/dev/null
+    wait "$socat_pid" 2>/dev/null
+    # Remove any remaining FIFOs and markers
+    rm -rf "$relay_dir"
+    log_ok "Relay stopped"
+    sleep 1
+}
+
+#=============================================================================
 # IN-CALL SESSION — PTT VOICE LOOP
 #=============================================================================
 
@@ -1419,7 +1634,11 @@ draw_call_header() {
     # Cipher info
     CIPHER_ROW=$_r
     local cipher_upper="${CIPHER^^}"
-    if [ -n "$_rcipher" ]; then
+    if [ -f "$DATA_DIR/run/relay_mode_$$" ]; then
+        # Relay mode — no remote cipher, show relay indicator
+        echo -e "  ${GREEN}●${NC} Local cipher:  ${WHITE}${cipher_upper}${NC}" >&2
+        echo -e "  ${CYAN}●${NC} Mode:          ${BOLD}${WHITE}RELAY${NC} ${DIM}(group call)${NC}" >&2
+    elif [ -n "$_rcipher" ]; then
         local rcipher_upper="${_rcipher^^}"
         if [ "$_rcipher" = "$CIPHER" ]; then
             echo -e "  ${GREEN}●${NC} Local cipher:  ${WHITE}${cipher_upper}${NC}" >&2
@@ -1504,7 +1723,17 @@ draw_call_header() {
     RECV_INFO_ROW=$_r
     _r=$((_r + 1))
 
-    echo -e "  ${DIM}Remote:     ${NC}${GREEN}Idle${NC}" >&2
+    if [ -f "$DATA_DIR/run/relay_mode_$$" ]; then
+        local _cached_gc=""
+        [ -f "$DATA_DIR/run/group_count_$$" ] && _cached_gc=$(cat "$DATA_DIR/run/group_count_$$" 2>/dev/null)
+        if [ -n "$_cached_gc" ]; then
+            echo -e "  ${DIM}Group:      ${NC}${WHITE}${_cached_gc} callers${NC}" >&2
+        else
+            echo -e "  ${DIM}Group:      ${NC}${WHITE}connecting...${NC}" >&2
+        fi
+    else
+        echo -e "  ${DIM}Remote:     ${NC}${GREEN}Idle${NC}" >&2
+    fi
     REMOTE_STATUS_ROW=$_r
     _r=$((_r + 1))
 
@@ -1599,27 +1828,50 @@ in_call_session() {
     # Remote address and cipher (populated by handshake / receive loop)
     local remote_id_file="$DATA_DIR/run/remote_id_$$"
     local remote_cipher_file="$DATA_DIR/run/remote_cipher_$$"
-    rm -f "$remote_id_file" "$remote_cipher_file"
+    local relay_flag_file="$DATA_DIR/run/relay_mode_$$"
+    rm -f "$remote_id_file" "$remote_cipher_file" "$relay_flag_file"
 
     # If we don't know the remote address yet (listener), wait briefly for handshake
     local remote_display="$known_remote"
     local remote_cipher=""
     if [ -z "$remote_display" ]; then
-        # Read first line — should be ID
+        # Read first line — could be RELAY:, ID:, or CIPHER:
         local first_line=""
         if read -r -t 3 first_line <&3 2>/dev/null; then
-            first_line=$(proto_verify "$first_line") || first_line=""
-            if [[ "$first_line" == ID:* ]]; then
-                remote_display="${first_line#ID:}"
+            # Check raw line for relay greeting (not HMAC-signed)
+            if [[ "$first_line" == RELAY:* ]]; then
+                touch "$relay_flag_file"
+                remote_display="RELAY (group)"
                 echo "$remote_display" > "$remote_id_file"
-            elif [[ "$first_line" == CIPHER:* ]]; then
-                remote_cipher="${first_line#CIPHER:}"
+            else
+                first_line=$(proto_verify "$first_line") || first_line=""
+                if [[ "$first_line" == ID:* ]]; then
+                    remote_display="${first_line#ID:}"
+                    echo "$remote_display" > "$remote_id_file"
+                elif [[ "$first_line" == CIPHER:* ]]; then
+                    remote_cipher="${first_line#CIPHER:}"
+                fi
+            fi
+        fi
+    else
+        # We know the remote (caller side) — check for RELAY: greeting
+        local peek_line=""
+        if read -r -t 2 peek_line <&3 2>/dev/null; then
+            # Check raw line for relay greeting (not HMAC-signed)
+            if [[ "$peek_line" == RELAY:* ]]; then
+                touch "$relay_flag_file"
+                remote_display="RELAY (group)"
+            else
+                peek_line=$(proto_verify "$peek_line") || peek_line=""
+                if [[ "$peek_line" == CIPHER:* ]]; then
+                    remote_cipher="${peek_line#CIPHER:}"
+                fi
             fi
         fi
     fi
 
-    # Try to read CIPHER: line (quick, non-blocking)
-    if [ -z "$remote_cipher" ]; then
+    # Try to read CIPHER: line (skip in relay mode — no cipher exchange)
+    if [ -z "$remote_cipher" ] && [ ! -f "$relay_flag_file" ]; then
         local cline=""
         if read -r -t 1 cline <&3 2>/dev/null; then
             cline=$(proto_verify "$cline") || cline=""
@@ -1652,6 +1904,25 @@ in_call_session() {
         while [ -f "$CONNECTED_FLAG" ]; do
             local line=""
             if read -r line <&3 2>/dev/null; then
+                # Handle relay protocol messages BEFORE proto_verify
+                # (these are sent by the relay, never HMAC-signed)
+                if [[ "$line" == GROUP:* ]]; then
+                    if [ ! -f "$relay_flag_file" ]; then
+                        touch "$relay_flag_file"
+                    fi
+                    local _gcount="${line#GROUP:}"
+                    # Cache count for header redraws (e.g., after mid-call settings)
+                    echo "$_gcount" > "$DATA_DIR/run/group_count_$$"
+                    printf '\033[s' >&2
+                    printf '\033[%d;1H\033[K' "$REMOTE_STATUS_ROW" >&2
+                    printf '  \033[2mGroup:      \033[0m\033[1;37m%s callers\033[0m' "$_gcount" >&2
+                    printf '\033[u' >&2
+                    continue
+                fi
+                if [[ "$line" == RELAY:* ]]; then
+                    [ ! -f "$relay_flag_file" ] && touch "$relay_flag_file"
+                    continue
+                fi
                 line=$(proto_verify "$line") || continue
                 case "$line" in
                     PTT_START)
@@ -1747,7 +2018,11 @@ in_call_session() {
                         rm -f "$enc_file" "$dec_file" 2>/dev/null
                         ;;
                     HANGUP)
-                        # Remote party hung up
+                        # In relay mode, ignore HANGUP (others may still be connected)
+                        if [ -f "$relay_flag_file" ]; then
+                            continue
+                        fi
+                        # Direct call — remote party hung up
                         echo -e "\r\n\r\n  ${YELLOW}${BOLD}Remote party hung up.${NC}" >&2
                         rm -f "$CONNECTED_FLAG"
                         break
@@ -2554,6 +2829,129 @@ settings_snowflake() {
     read -r
 }
 
+settings_ports() {
+    clear
+    echo -e "\n${BOLD}${CYAN}═══ Configure Ports ═══${NC}\n"
+    echo -e "  ${DIM}Change the listen port and Tor SOCKS port. Both must${NC}"
+    echo -e "  ${DIM}be unique per instance if running multiple copies of${NC}"
+    echo -e "  ${DIM}TerminalPhone on the same device.${NC}"
+    echo ""
+    echo -e "  ${DIM}Current listen port: ${NC}${WHITE}${LISTEN_PORT}${NC}  ${DIM}(hidden service \u0026 incoming calls)${NC}"
+    echo -e "  ${DIM}Current SOCKS port:  ${NC}${WHITE}${TOR_SOCKS_PORT}${NC}  ${DIM}(Tor proxy for outbound calls)${NC}"
+    echo ""
+
+    echo -ne "  ${BOLD}New listen port ${DIM}[${LISTEN_PORT}]${NC}${BOLD}: ${NC}"
+    read -r _new_listen
+    if [ -n "$_new_listen" ]; then
+        if [[ "$_new_listen" =~ ^[0-9]+$ ]] && [ "$_new_listen" -ge 1024 ] && [ "$_new_listen" -le 65535 ]; then
+            LISTEN_PORT=$_new_listen
+        else
+            echo -e "  ${RED}Invalid port (must be 1024–65535). Keeping $LISTEN_PORT.${NC}"
+        fi
+    fi
+
+    echo -ne "  ${BOLD}New SOCKS port  ${DIM}[${TOR_SOCKS_PORT}]${NC}${BOLD}: ${NC}"
+    read -r _new_socks
+    if [ -n "$_new_socks" ]; then
+        if [[ "$_new_socks" =~ ^[0-9]+$ ]] && [ "$_new_socks" -ge 1024 ] && [ "$_new_socks" -le 65535 ]; then
+            if [ "$_new_socks" = "$LISTEN_PORT" ]; then
+                echo -e "  ${RED}SOCKS port cannot be the same as listen port. Keeping $TOR_SOCKS_PORT.${NC}"
+            else
+                TOR_SOCKS_PORT=$_new_socks
+            fi
+        else
+            echo -e "  ${RED}Invalid port (must be 1024–65535). Keeping $TOR_SOCKS_PORT.${NC}"
+        fi
+    fi
+
+    save_config
+    echo ""
+    echo -e "  ${GREEN}${BOLD}✓${NC} Ports set — listen: ${WHITE}${LISTEN_PORT}${NC}, SOCKS: ${WHITE}${TOR_SOCKS_PORT}${NC}"
+    echo -e "  ${DIM}Restart Tor for changes to take effect.${NC}"
+    echo -ne "  ${DIM}Press Enter to continue...${NC}"
+    read -r
+}
+
+settings_single_hop() {
+    while true; do
+        clear
+        echo -e "\n${BOLD}${CYAN}═══ Single-Hop Mode ═══${NC}\n"
+
+        local sh_label="${RED}disabled${NC}"
+        if [ "$SINGLE_HOP" -eq 1 ]; then
+            sh_label="${YELLOW}enabled${NC}"
+        fi
+        echo -e "  ${DIM}Status:${NC} ${sh_label}"
+        echo ""
+
+        echo -e "  ${DIM}By default, Tor builds a 3-hop circuit for your hidden${NC}"
+        echo -e "  ${DIM}service. This protects your identity but adds latency${NC}"
+        echo -e "  ${DIM}— each hop means an extra network round-trip.${NC}"
+        echo ""
+        echo -e "  ${DIM}Single-hop mode reduces this to 1 hop. Your hidden${NC}"
+        echo -e "  ${DIM}service connects directly through a single relay to${NC}"
+        echo -e "  ${DIM}the rendezvous point, cutting latency significantly.${NC}"
+        echo ""
+        echo -e "  ${BOLD}${WHITE}Normal:${NC}     ${DIM}Caller → 3 hops → [RP] ← 3 hops ← You  (6 total)${NC}"
+        echo -e "  ${BOLD}${WHITE}Single-hop:${NC} ${DIM}Caller → 3 hops → [RP] ← 1 hop  ← You  (4 total)${NC}"
+        echo ""
+        echo -e "  ${RED}${BOLD}⚠  TRADEOFFS:${NC}"
+        echo -e "  ${RED}•${NC} ${DIM}Your server's real IP is visible to the relay you${NC}"
+        echo -e "    ${DIM}connect through. Your anonymity as the listener is${NC}"
+        echo -e "    ${DIM}completely gone — the relay knows who is hosting${NC}"
+        echo -e "    ${DIM}this hidden service.${NC}"
+        echo -e "  ${RED}•${NC} ${DIM}The SOCKS proxy is disabled in this mode. You${NC}"
+        echo -e "    ${DIM}cannot make outbound calls — only receive them.${NC}"
+        echo -e "    ${DIM}To call someone, disable this and restart Tor.${NC}"
+        echo ""
+        echo -e "  ${GREEN}•${NC} ${DIM}Callers connecting to you are still fully anonymous${NC}"
+        echo -e "    ${DIM}(they still use their own 3-hop circuit).${NC}"
+        echo -e "  ${GREEN}•${NC} ${DIM}Noticeably lower latency for voice and chat.${NC}"
+        echo ""
+        echo -e "  ${YELLOW}Best for: hosting a line others call into, where you${NC}"
+        echo -e "  ${YELLOW}don't need to hide your server's location.${NC}"
+        echo ""
+
+        echo -e "  ${BOLD}${WHITE}1${NC} ${CYAN}│${NC} Turn on"
+        echo -e "  ${BOLD}${WHITE}2${NC} ${CYAN}│${NC} Turn off"
+        echo -e "  ${BOLD}${WHITE}0${NC} ${CYAN}│${NC} ${DIM}Back${NC}"
+        echo ""
+        echo -ne "  ${BOLD}Select: ${NC}"
+        read -r _sh_choice
+
+        case "$_sh_choice" in
+            1)
+                if [ "$SINGLE_HOP" -eq 1 ]; then
+                    log_info "Single-hop mode is already enabled"
+                else
+                    SINGLE_HOP=1
+                    save_config
+                    log_ok "Single-hop mode enabled"
+                    echo -e "  ${YELLOW}SOCKS proxy will be disabled — outbound calls unavailable.${NC}"
+                    echo -e "  ${DIM}Restart Tor for changes to take effect.${NC}"
+                fi
+                sleep 2
+                ;;
+            2)
+                if [ "$SINGLE_HOP" -eq 0 ]; then
+                    log_info "Single-hop mode is already disabled"
+                else
+                    SINGLE_HOP=0
+                    save_config
+                    log_ok "Single-hop mode disabled (normal 3-hop anonymity restored)"
+                    echo -e "  ${DIM}Restart Tor for changes to take effect.${NC}"
+                fi
+                sleep 2
+                ;;
+            0|q|Q) return ;;
+            *)
+                echo -e "\n  ${RED}Invalid choice${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 settings_voice() {
     echo -e "\n${BOLD}${CYAN}═══ Voice Changer ═══${NC}\n"
     echo -e "  ${DIM}Current effect: ${NC}${GREEN}${VOICE_EFFECT}${NC}\n"
@@ -2702,14 +3100,23 @@ settings_tor() {
         if [ "$SNOWFLAKE_ENABLED" -eq 1 ]; then
             sf_label="${GREEN}enabled${NC}"
         fi
+        local sh_label="${RED}disabled${NC}"
+        if [ "$SINGLE_HOP" -eq 1 ]; then
+            sh_label="${YELLOW}enabled${NC}"
+        fi
         echo -e "  ${DIM}Circuit display:  ${NC}${circ_label}"
         echo -e "  ${DIM}Exclude nodes:    ${NC}${excl_label}"
         echo -e "  ${DIM}Snowflake bridge: ${NC}${sf_label}"
+        echo -e "  ${DIM}Single-hop mode:  ${NC}${sh_label}"
+        echo -e "  ${DIM}Listen port:      ${NC}${WHITE}${LISTEN_PORT}${NC}"
+        echo -e "  ${DIM}SOCKS port:       ${NC}${WHITE}${TOR_SOCKS_PORT}${NC}"
         echo ""
 
         echo -e "  ${BOLD}${WHITE}1${NC} ${CYAN}│${NC} Toggle circuit hop display in calls"
         echo -e "  ${BOLD}${WHITE}2${NC} ${CYAN}│${NC} Exclude countries from circuits"
         echo -e "  ${BOLD}${WHITE}3${NC} ${CYAN}│${NC} Snowflake bridge (censorship circumvention)"
+        echo -e "  ${BOLD}${WHITE}4${NC} ${CYAN}│${NC} Single-hop mode (low latency)"
+        echo -e "  ${BOLD}${WHITE}5${NC} ${CYAN}│${NC} Configure ports"
         echo -e "  ${BOLD}${WHITE}0${NC} ${CYAN}│${NC} ${DIM}Back${NC}"
         echo ""
         echo -ne "  ${BOLD}Select: ${NC}"
@@ -2731,6 +3138,8 @@ settings_tor() {
                 ;;
             2) settings_exclude_nodes ;;
             3) settings_snowflake ;;
+            4) settings_single_hop ;;
+            5) settings_ports ;;
             0|q|Q) return ;;
             *)
                 echo -e "\n  ${RED}Invalid choice${NC}"
@@ -3011,6 +3420,7 @@ main_menu() {
         echo -e "  ${BOLD}${WHITE}10${NC}${CYAN}│${NC} Restart Tor"
         echo -e "  ${BOLD}${WHITE}11${NC}${CYAN}│${NC} Rotate onion address"
         echo -e "  ${BOLD}${WHITE}12${NC}${CYAN}│${NC} Settings"
+        echo -e "  ${BOLD}${WHITE}13${NC}${CYAN}│${NC} Relay mode (group bridge)"
         echo -e "  ${BOLD}${WHITE}0${NC} ${CYAN}│${NC} ${RED}Quit${NC}"
         echo ""
         echo -ne "  ${BOLD}Select: ${NC}"
@@ -3140,6 +3550,11 @@ main_menu() {
             12)
                 settings_menu
                 ;;
+            13)
+                relay_mode
+                echo -ne "\n  ${DIM}Press Enter to continue...${NC}"
+                read -r
+                ;;
             0|q|Q)
                 echo -e "\n${GREEN}Goodbye!${NC}"
                 stop_tor
@@ -3198,6 +3613,10 @@ case "${1:-}" in
             echo "Usage: $0 call <onion-address>"
         fi
         ;;
+    relay)
+        load_config
+        relay_mode
+        ;;
     help|-h|--help)
         echo -e "${BOLD}${APP_NAME} v${VERSION}${NC}"
         echo ""
@@ -3210,6 +3629,7 @@ case "${1:-}" in
         echo "  status     Show current status"
         echo "  listen     Start listening for calls"
         echo "  call ADDR  Call an onion address"
+        echo "  relay      Start relay mode (group bridge)"
         echo "  help       Show this help"
         ;;
     *)
