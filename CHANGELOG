@@ -213,3 +213,13 @@ Both ports are validated (1024–65535) and checked to prevent collision. Enable
 on the same device with separate Tor processes by assigning unique port pairs to each instance.
 Primary use case: a relay operator who also wants to join their own group call can run the relay on one instance, 
 change the SOCKS port on a second instance, and dial into the relay as a regular caller.
+
+Version 1.1.5.1 3-2-26
+
+Relay stats persistence. Fixed relay data throughput counters (In/Out) dropping when a caller disconnects. 
+The handler now accumulates each caller's byte counts into a persistent totals file before cleanup. 
+The monitoring loop sums both active handler stats and accumulated totals so the counters only go up.
+
+Periodic group count broadcast. The relay now broadcasts GROUP:N to all clients every ~10 seconds 
+from the monitoring loop, in addition to on join/leave events. Clients cache the last received count 
+so that returning from mid-call settings displays the correct group size immediately instead of "connecting...".
