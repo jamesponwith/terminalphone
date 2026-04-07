@@ -9,8 +9,8 @@ set -euo pipefail
 # CONFIGURATION
 #=============================================================================
 APP_NAME="TerminalPhone"
-VERSION="1.1.5.1"
-BASE_DIR="$(dirname "$(readlink -f "$0")")"
+VERSION="1.1.6"
+BASE_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 DATA_DIR="$BASE_DIR/.terminalphone"
 TOR_DIR="$DATA_DIR/tor_data"
 TOR_CONF="$DATA_DIR/torrc"
@@ -77,8 +77,21 @@ TOR_PURPLE='\033[38;2;125;70;152m'
 
 # Platform detection
 IS_TERMUX=0
+IS_MACOS=0
 if [ -n "${TERMUX_VERSION:-}" ] || { [ -n "${PREFIX:-}" ] && [[ "${PREFIX:-}" == *"com.termux"* ]]; }; then
     IS_TERMUX=1
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+    IS_MACOS=1
+fi
+
+# Ensure Homebrew is in PATH on macOS (Apple Silicon: /opt/homebrew, Intel: /usr/local)
+if [ $IS_MACOS -eq 1 ]; then
+    for _brew_prefix in /opt/homebrew /usr/local; do
+        if [ -x "$_brew_prefix/bin/brew" ]; then
+            export PATH="$_brew_prefix/bin:$_brew_prefix/sbin:$PATH"
+            break
+        fi
+    done
 fi
 
 # State
@@ -90,6 +103,19 @@ ORIGINAL_STTY=""
 #=============================================================================
 # HELPERS
 #=============================================================================
+
+# Portable case conversion (works with Bash 3.2 on macOS)
+to_upper() { echo "$1" | tr '[:lower:]' '[:upper:]'; }
+to_lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# Portable file size (macOS stat uses -f%z, GNU stat uses -c%s)
+file_size() {
+    if [ $IS_MACOS -eq 1 ]; then
+        stat -f%z "$1" 2>/dev/null || echo 0
+    else
+        stat -c%s "$1" 2>/dev/null || echo 0
+    fi
+}
 
 cleanup() {
     # Restore terminal
@@ -266,10 +292,13 @@ install_deps() {
     local pkg_names_dnf="tor opus-tools sox socat openssl alsa-utils"
     local pkg_names_pacman="tor opus-tools sox socat openssl alsa-utils"
     local pkg_names_pkg="tor opus-tools sox socat openssl-tool ffmpeg termux-api"
+    local pkg_names_brew="tor opus-tools sox socat openssl"
 
     # Shared deps + platform-specific
     if [ $IS_TERMUX -eq 1 ]; then
         all_deps=(tor opusenc opusdec sox socat openssl ffmpeg termux-microphone-record)
+    elif [ $IS_MACOS -eq 1 ]; then
+        all_deps=(tor opusenc opusdec sox socat openssl rec play)
     else
         all_deps=(tor opusenc opusdec sox socat openssl arecord aplay)
     fi
@@ -315,6 +344,27 @@ install_deps() {
         pkg install -y $pkg_names_pkg
         echo -e "\n${YELLOW}${BOLD}NOTE:${NC} You must also install the ${BOLD}Termux:API${NC} app from F-Droid"
         echo -e "      for microphone access.\n"
+    elif [ $IS_MACOS -eq 1 ]; then
+        # macOS: install Homebrew if not present, then use brew
+        if ! check_dep brew; then
+            log_info "Homebrew not found — installing Homebrew first..."
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            # Add Homebrew to PATH for this session
+            for _brew_prefix in /opt/homebrew /usr/local; do
+                if [ -x "$_brew_prefix/bin/brew" ]; then
+                    export PATH="$_brew_prefix/bin:$_brew_prefix/sbin:$PATH"
+                    break
+                fi
+            done
+            if ! check_dep brew; then
+                log_err "Homebrew installation failed"
+                log_err "Install Homebrew manually: https://brew.sh"
+                return 1
+            fi
+            log_ok "Homebrew installed"
+        fi
+        log_info "Installing dependencies via Homebrew..."
+        brew install $pkg_names_brew
     elif check_dep apt-get; then
         log_info "Detected apt package manager"
         $SUDO apt-get update -qq
@@ -327,7 +377,7 @@ install_deps() {
         $SUDO pacman -S --noconfirm $pkg_names_pacman
     else
         log_err "No supported package manager found!"
-        log_err "Please install manually: tor, opus-tools, sox, socat, openssl, alsa-utils"
+        log_err "Please install manually: tor, opus-tools, sox, socat, openssl"
         return 1
     fi
 
@@ -447,6 +497,8 @@ install_snowflake() {
 
     if [ $IS_TERMUX -eq 1 ]; then
         pkg install -y snowflake-client
+    elif check_dep brew; then
+        brew install snowflake
     elif check_dep apt-get; then
         $SUDO apt-get update -qq
         $SUDO apt-get install -y snowflake-client
@@ -609,7 +661,7 @@ rotate_onion() {
 
 # Map 2-letter country code to full name
 cc_to_country() {
-    case "${1,,}" in
+    case "$(to_lower "$1")" in
         ad) echo "Andorra";; ae) echo "UAE";; al) echo "Albania";; am) echo "Armenia";;
         at) echo "Austria";; au) echo "Australia";; az) echo "Azerbaijan";;
         ba) echo "Bosnia";; be) echo "Belgium";; bg) echo "Bulgaria";; br) echo "Brazil";;
@@ -637,7 +689,7 @@ cc_to_country() {
         tw) echo "Taiwan";; ua) echo "Ukraine";; us) echo "USA";;
         uy) echo "Uruguay";; uz) echo "Uzbekistan";; ve) echo "Venezuela";;
         vn) echo "Vietnam";; za) echo "South Africa";;
-        *) echo "${1^^}";;
+        *) to_upper "$1";;
     esac
 }
 
@@ -892,6 +944,8 @@ audio_record() {
                 "$outfile" &>/dev/null || log_warn "ffmpeg conversion failed"
         fi
         rm -f "$tmp_rec"
+    elif [ $IS_MACOS -eq 1 ]; then
+        rec -q -t raw -r "$SAMPLE_RATE" -e signed -b 16 -c 1 "$outfile" trim 0 "$duration" 2>/dev/null
     else
         arecord -f S16_LE -r "$SAMPLE_RATE" -c 1 -t raw -d "$duration" \
             -q "$outfile" 2>/dev/null
@@ -907,6 +961,10 @@ start_recording() {
         REC_FILE="$AUDIO_DIR/msg_${_id}.tmp"
         rm -f "$REC_FILE"
         termux-microphone-record -l 120 -f "$REC_FILE" &>/dev/null &
+        REC_PID=$!
+    elif [ $IS_MACOS -eq 1 ]; then
+        REC_FILE="$AUDIO_DIR/msg_${_id}.tmp"
+        rec -q -t raw -r "$SAMPLE_RATE" -e signed -b 16 -c 1 "$REC_FILE" 2>/dev/null &
         REC_PID=$!
     else
         REC_FILE="$AUDIO_DIR/msg_${_id}.tmp"
@@ -1007,13 +1065,13 @@ stop_and_send() {
             encrypt_file "$opus_file" "$enc_file" 2>/dev/null
             if [ -s "$enc_file" ]; then
                 local enc_size
-                enc_size=$(stat -c%s "$enc_file" 2>/dev/null || echo 0)
+                enc_size=$(file_size "$enc_file")
                 local size_kb=$(( enc_size * 10 / 1024 ))
                 local size_whole=$(( size_kb / 10 ))
                 local size_frac=$(( size_kb % 10 ))
 
                 local b64
-                b64=$(base64 -w 0 "$enc_file" 2>/dev/null)
+                b64=$(base64 < "$enc_file" | tr -d '\n')
                 proto_send "AUDIO:${b64}"
                 LAST_SENT_INFO="${size_whole}.${size_frac}KB"
             fi
@@ -1027,12 +1085,12 @@ audio_play() {
     local infile="$1"
     local rate="${2:-48000}"
 
-    if [ $IS_TERMUX -eq 1 ]; then
-        # Termux: use sox play (avoids Android MediaPlayer indexing)
-        play -q -t raw -r "$rate" -e signed -b 16 -c 1 "$infile" 2>/dev/null || true
-    else
+    if [ $IS_TERMUX -eq 0 ] && [ $IS_MACOS -eq 0 ]; then
         # Linux: use ALSA aplay
         aplay -f S16_LE -r "$rate" -c 1 -q "$infile" 2>/dev/null
+    else
+        # macOS / Termux: use sox play
+        play -q -t raw -r "$rate" -e signed -b 16 -c 1 "$infile" 2>/dev/null || true
     fi
 }
 
@@ -1042,8 +1100,8 @@ audio_play() {
 play_chunk() {
     local opus_file="$1"
 
-    if [ $IS_TERMUX -eq 1 ]; then
-        # Termux: pipe decode directly to sox play (avoids temp file + Android media framework)
+    if [ $IS_TERMUX -eq 1 ] || [ $IS_MACOS -eq 1 ]; then
+        # macOS / Termux: pipe decode directly to sox play
         opusdec --quiet --rate 48000 "$opus_file" - 2>/dev/null | \
             play -q -t raw -r 48000 -e signed -b 16 -c 1 - 2>/dev/null || true
     else
@@ -1644,13 +1702,13 @@ draw_call_header() {
 
     # Cipher info
     CIPHER_ROW=$_r
-    local cipher_upper="${CIPHER^^}"
+    local cipher_upper="$(to_upper "$CIPHER")"
     if [ -f "$DATA_DIR/run/relay_mode_$$" ]; then
         # Relay mode — no remote cipher, show relay indicator
         echo -e "  ${GREEN}●${NC} Local cipher:  ${WHITE}${cipher_upper}${NC}" >&2
         echo -e "  ${CYAN}●${NC} Mode:          ${BOLD}${WHITE}RELAY${NC} ${DIM}(group call)${NC}" >&2
     elif [ -n "$_rcipher" ]; then
-        local rcipher_upper="${_rcipher^^}"
+        local rcipher_upper="$(to_upper "$_rcipher")"
         if [ "$_rcipher" = "$CIPHER" ]; then
             echo -e "  ${GREEN}●${NC} Local cipher:  ${WHITE}${cipher_upper}${NC}" >&2
             echo -e "  ${GREEN}●${NC} Remote cipher: ${WHITE}${rcipher_upper}${NC}" >&2
@@ -1966,8 +2024,8 @@ in_call_session() {
                         # Read current local cipher from runtime file
                         local _cur_cipher="$CIPHER"
                         [ -f "$CIPHER_RUNTIME_FILE" ] && _cur_cipher=$(cat "$CIPHER_RUNTIME_FILE")
-                        local _cu="${_cur_cipher^^}"
-                        local _ru="${rc^^}"
+                        local _cu="$(to_upper "$_cur_cipher")"
+                        local _ru="$(to_upper "$rc")"
                         # Update cipher lines in-place using ANSI cursor positioning (rows 4-5)
                         local _dot_color
                         if [ "$rc" = "$_cur_cipher" ]; then
@@ -2010,7 +2068,7 @@ in_call_session() {
                             if decrypt_file "$enc_file" "$dec_file" 2>/dev/null; then
                                 # Calculate recv size
                                 local _enc_sz=0
-                                _enc_sz=$(stat -c%s "$enc_file" 2>/dev/null || echo 0)
+                                _enc_sz=$(file_size "$enc_file")
                                 local _sz_kb=$(( _enc_sz * 10 / 1024 ))
                                 local _sz_w=$(( _sz_kb / 10 ))
                                 local _sz_f=$(( _sz_kb % 10 ))
@@ -2156,7 +2214,7 @@ in_call_session() {
                 encrypt_file "$chat_plain" "$chat_enc" 2>/dev/null
                 if [ -s "$chat_enc" ]; then
                     local chat_b64
-                    chat_b64=$(base64 -w 0 "$chat_enc" 2>/dev/null)
+                    chat_b64=$(base64 < "$chat_enc" | tr -d '\n')
                     proto_send "MSG:${chat_b64}"
                     echo -e "  ${DIM}[you] ${chat_msg}${NC}" >&2
                 fi
@@ -2214,6 +2272,8 @@ test_audio() {
     local audio_deps=(opusenc opusdec)
     if [ $IS_TERMUX -eq 1 ]; then
         audio_deps+=(termux-microphone-record ffmpeg)
+    elif [ $IS_MACOS -eq 1 ]; then
+        audio_deps+=(rec play)
     else
         audio_deps+=(arecord aplay)
     fi
@@ -2245,7 +2305,7 @@ test_audio() {
     fi
 
     local raw_size
-    raw_size=$(stat -c%s "$raw_file")
+    raw_size=$(file_size "$raw_file")
     echo -e "  ${DIM}Recorded $raw_size bytes of raw audio${NC}"
 
     # Step 2: Encode with Opus
@@ -2264,7 +2324,7 @@ test_audio() {
     fi
 
     local opus_size
-    opus_size=$(stat -c%s "$opus_file")
+    opus_size=$(file_size "$opus_file")
     echo -e "  ${DIM}Opus size: $opus_size bytes (compression ratio: $((raw_size / opus_size))x)${NC}"
 
     # Step 3: Encrypt + Decrypt round-trip (if secret is set)
@@ -2322,7 +2382,7 @@ show_status() {
     fi
 
     # Audio
-    if check_dep arecord && check_dep opusenc; then
+    if { [ $IS_MACOS -eq 1 ] && check_dep rec; } || { [ $IS_MACOS -eq 0 ] && check_dep arecord; } && check_dep opusenc; then
         echo -e "  ${GREEN}●${NC} Audio pipeline ready"
     else
         echo -e "  ${RED}●${NC} Audio dependencies missing"
@@ -3277,7 +3337,7 @@ settings_security() {
         if [ "$HMAC_AUTH" -eq 1 ]; then
             hmac_label="${GREEN}enabled${NC}"
         fi
-        local cipher_upper="${CIPHER^^}"
+        local cipher_upper="$(to_upper "$CIPHER")"
         echo -e "  ${DIM}Cipher:     ${NC}${WHITE}${cipher_upper}${NC}"
         echo -e "  ${DIM}HMAC auth:  ${NC}${hmac_label}"
         echo ""
@@ -3389,7 +3449,7 @@ show_banner() {
     echo -e "  ${TOR_PURPLE}───────────────────────────────────────${NC}"
     echo -e "  ${TOR_PURPLE}${BOLD}Encrypted Voice & Chat${NC} ${DIM}over${NC} ${TOR_PURPLE}${BOLD}Tor${NC} ${DIM}Hidden Services${NC}"
     echo -e "  ${TOR_PURPLE}───────────────────────────────────────${NC}"
-    local cipher_display="${CIPHER^^}"
+    local cipher_display="$(to_upper "$CIPHER")"
     echo -e "  ${DIM}v${VERSION} | Push-to-Talk | End-to-End ${cipher_display}${NC}\n"
 }
 
@@ -3489,6 +3549,8 @@ main_menu() {
                             if [ $IS_TERMUX -eq 1 ]; then
                                 SUDO=""
                                 pkg install -y libqrencode 2>/dev/null
+                            elif check_dep brew; then
+                                brew install qrencode 2>/dev/null
                             elif check_dep apt-get; then
                                 $SUDO apt-get install -y qrencode 2>/dev/null
                             elif check_dep dnf; then
