@@ -227,3 +227,7 @@ so that returning from mid-call settings displays the correct group size immedia
 Version 1.1.6
 
 MacOS Supported Now.
+
+Version 1.1.6 5-38-26
+
+Changed the file name for the loopback test from test_ to test_o_ to avoid collision with inputfile. Audio would not playback on the test loop for macOS as discovered by user. Keeping the identical version for this fix.
