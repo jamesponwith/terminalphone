@@ -2310,7 +2310,7 @@ test_audio() {
 
     # Step 2: Encode with Opus
     echo -ne "  ${YELLOW}● Encoding with Opus at ${OPUS_BITRATE}kbps...${NC} "
-    local opus_file="$AUDIO_DIR/test_${_tid}.tmp"
+    local opus_file="$AUDIO_DIR/test_o_${_tid}.tmp"
     opusenc --raw --raw-rate "$SAMPLE_RATE" --raw-chan 1 \
         --bitrate "$OPUS_BITRATE" --framesize "$OPUS_FRAMESIZE" \
         --speech --quiet \
