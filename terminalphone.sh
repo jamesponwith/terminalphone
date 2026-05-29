@@ -85,14 +85,26 @@ elif [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 
 # Ensure Homebrew is in PATH on macOS (Apple Silicon: /opt/homebrew, Intel: /usr/local)
+# BREW_ARCH holds an "arch -arch" prefix so brew runs under the architecture that
+# matches its prefix. This avoids the "Cannot install under Rosetta 2 in ARM default
+# prefix" error when the script itself is launched as an x86_64 (Rosetta) process.
+BREW_ARCH=""
 if [ $IS_MACOS -eq 1 ]; then
     for _brew_prefix in /opt/homebrew /usr/local; do
         if [ -x "$_brew_prefix/bin/brew" ]; then
             export PATH="$_brew_prefix/bin:$_brew_prefix/sbin:$PATH"
+            # /opt/homebrew is the ARM prefix; force arm64 so a Rosetta shell can still use it.
+            if [ "$_brew_prefix" = "/opt/homebrew" ] && [ "$(uname -m)" = "x86_64" ]; then
+                BREW_ARCH="arch -arm64"
+            fi
             break
         fi
     done
 fi
+# Run brew under the correct architecture (no-op prefix when BREW_ARCH is empty).
+brew_run() {
+    $BREW_ARCH brew "$@"
+}
 
 # State
 TOR_PID=""
@@ -353,6 +365,9 @@ install_deps() {
             for _brew_prefix in /opt/homebrew /usr/local; do
                 if [ -x "$_brew_prefix/bin/brew" ]; then
                     export PATH="$_brew_prefix/bin:$_brew_prefix/sbin:$PATH"
+                    if [ "$_brew_prefix" = "/opt/homebrew" ] && [ "$(uname -m)" = "x86_64" ]; then
+                        BREW_ARCH="arch -arm64"
+                    fi
                     break
                 fi
             done
@@ -364,7 +379,8 @@ install_deps() {
             log_ok "Homebrew installed"
         fi
         log_info "Installing dependencies via Homebrew..."
-        brew install $pkg_names_brew
+        [ -n "$BREW_ARCH" ] && log_info "Running brew under arm64 (Rosetta shell detected)"
+        brew_run install $pkg_names_brew
     elif check_dep apt-get; then
         log_info "Detected apt package manager"
         $SUDO apt-get update -qq
@@ -498,7 +514,7 @@ install_snowflake() {
     if [ $IS_TERMUX -eq 1 ]; then
         pkg install -y snowflake-client
     elif check_dep brew; then
-        brew install snowflake
+        brew_run install snowflake
     elif check_dep apt-get; then
         $SUDO apt-get update -qq
         $SUDO apt-get install -y snowflake-client
@@ -3550,7 +3566,7 @@ main_menu() {
                                 SUDO=""
                                 pkg install -y libqrencode 2>/dev/null
                             elif check_dep brew; then
-                                brew install qrencode 2>/dev/null
+                                brew_run install qrencode 2>/dev/null
                             elif check_dep apt-get; then
                                 $SUDO apt-get install -y qrencode 2>/dev/null
                             elif check_dep dnf; then
