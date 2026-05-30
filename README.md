@@ -109,6 +109,8 @@ Select option **7** to install all dependencies automatically. If [Homebrew](htt
 
 **Note:** macOS uses `sox` for both recording (`rec`) and playback (`play`) instead of ALSA. No additional audio packages are needed.
 
+**Apple Silicon (M1/M2/M3+):** If your terminal happens to be running under Rosetta 2 (an `x86_64` process) while Homebrew is installed in the native ARM prefix (`/opt/homebrew`), `brew install` normally fails with `Cannot install under Rosetta 2 in ARM default prefix`. The dependency installer now detects this and automatically reruns Homebrew under `arch -arm64`, so option **7** works regardless of how the script was launched.
+
 ### Termux (Android)
 
 TerminalPhone supports Android devices through Termux. Due to Android's sandboxed audio architecture, two additional components are required.
@@ -358,6 +360,9 @@ On first launch, Tor must download the full network consensus from scratch, whic
 
 **Hang up does not return to menu:**
 If the script hangs after pressing Q, press Ctrl+C to force cleanup and return to the shell.
+
+**`Cannot install under Rosetta 2 in ARM default prefix` on macOS:**
+This happens on Apple Silicon when the terminal is running under Rosetta 2 (an `x86_64` process) but Homebrew lives in the native ARM prefix (`/opt/homebrew`). The dependency installer (option **7**) now detects this and automatically reruns `brew` under `arch -arm64`. If you are installing packages manually, prefix them yourself: `arch -arm64 brew install <pkg>`. Alternatively, launch the script natively with `arch -arm64 bash terminalphone.sh`.
 
 ---
 
