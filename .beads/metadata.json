@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "terminalphone",
+  "project_id": "35f3edb0-422e-4d4d-918e-2eea357e5a40"
+}

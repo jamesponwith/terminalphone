@@ -1,0 +1,46 @@
+[package]
+name = "tphone"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "terminalphone"
+path = "src/main.rs"
+
+[dependencies]
+# async runtime + primitives
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
+futures = "0.3.32"
+bytes = "1"
+
+# error handling + diagnostics
+anyhow = "1.0.102"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# transport: arti / Tor (pinned to rs-spike's proven 0.42 line so the workspace shares builds)
+arti-client = { version = "0.42.0", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client"] }
+tor-hsservice = "0.42.0"
+tor-cell = "0.42.0"
+tor-proto = "0.42.0"
+tor-rtcompat = "0.42.0"
+safelog = "0.8.2"
+rustls = { version = "0.23.40", default-features = false, features = ["ring"] }
+
+# crypto: AEAD suites + KDF + hygiene
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+aead = "0.5"
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+
+# audio + terminal
+cpal = "0.15"
+audiopus = "0.2"
+crossterm = "0.28"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time", "test-util"] }
