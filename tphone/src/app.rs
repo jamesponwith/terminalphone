@@ -145,11 +145,17 @@ impl App {
 
         self.state = AppState::InCall;
 
-        // 4. Bring up audio + the pipelined PTT loop. Audio is cpal-backed and
-        // therefore hardware-dependent; on a headless host this fails loudly
-        // rather than running a silent call.
-        let io = spawn_audio_bridge(&self.cfg, &peer)?;
-        let outcome = run_call(conn, keys, role, peer.clone(), io).await;
+        // 4. Bring up audio + the TUI + the pipelined PTT loop. Audio is
+        // cpal-backed and therefore hardware-dependent; on a headless host this
+        // fails loudly rather than running a silent call. The TUI owns the
+        // terminal and drives PTT / text / hangup; the call core seals/opens
+        // frames over the wire.
+        let local_onion = transport
+            .onion_address()
+            .map(|a| a.host().to_string())
+            .unwrap_or_else(|| "unknown.onion".to_string());
+        let outcome =
+            run_interactive(&self.cfg, conn, keys, role, peer.clone(), &local_onion).await;
 
         // 5. Teardown. Drop of CallKeys zeroizes; transport drop tears circuits.
         self.state = AppState::Hangup;
@@ -203,60 +209,147 @@ pub struct CallIo {
     pub hangup: mpsc::Receiver<()>,
 }
 
-/// Bring up the cpal-backed [`AudioEngine`] and bridge it to a [`CallIo`] the
-/// call loop drives.
+/// Drive a live, interactive call: bridge the cpal [`AudioEngine`] and the TUI
+/// to [`run_call`] over `conn`.
 ///
-/// The bridge spawns two pumps:
-///   * inbound: drain `audio_in` and hand each opened [`OpusFrame`] to
-///     [`AudioEngine::play`] (decode + jitter buffer);
-///   * outbound: drain the engine's capture receiver into `audio_out` so the
-///     send loop seals + transmits each frame as produced.
+/// This is the production call path. It:
+///   * brings up the cpal-backed engine (a missing device surfaces as a clean
+///     [`Error::Audio`], never a panic);
+///   * builds a [`CallIo`] and spawns the [`run_call`] core;
+///   * enters the raw-mode TUI and translates [`crate::tui::UiEvent`]s into call
+///     actions — PTT start/stop drives capture; text becomes a `MSG`; `q`/Ctrl-C
+///     hangs up — while routing decoded inbound audio into playback and inbound
+///     text + stats onto the call screen.
 ///
-/// PTT gating, text input, and the hangup signal are surfaced from the TUI in a
-/// fuller build; here `msg_out`/`hangup` are returned live but unattached on the
-/// production binary (the TUI wiring is the remaining UI work — see `tui.rs`).
-///
-/// This path is hardware-dependent: on a host with no audio device,
-/// [`AudioEngine::start`] fails and the call is aborted with a clear error
-/// rather than running silently. It is intentionally NOT exercised by the
-/// headless integration test, which drives [`run_call`] directly with synthetic
-/// frames over the loopback transport.
-fn spawn_audio_bridge(cfg: &Config, peer: &PeerInfo) -> Result<CallIo> {
+/// Returns when the user hangs up or the peer drops.
+async fn run_interactive(
+    cfg: &Config,
+    conn: Conn,
+    keys: CallKeys,
+    role: Role,
+    peer: PeerInfo,
+    local_onion: &str,
+) -> Result<()> {
     use crate::audio::{AudioConfig, AudioEngine};
+    use crate::tui::{CallScreen, Tui, UiEvent};
 
-    // Decode side uses the peer's advertised Opus params; encode uses ours.
+    // Bring up audio first so a missing device fails before we touch the UI.
     let engine = AudioEngine::start(AudioConfig { opus: cfg.opus })?;
-    let _ = peer; // peer.opus drives the decoder inside the engine in a fuller build.
 
-    let (audio_out_tx, audio_out_rx) = mpsc::channel::<OpusFrame>(64);
-    let (msg_out_tx, msg_out_rx) = mpsc::channel::<String>(8);
+    // Channels into the call core.
+    let (audio_out_tx, audio_out) = mpsc::channel::<OpusFrame>(64);
+    let (msg_out_tx, msg_out) = mpsc::channel::<String>(8);
     let (audio_in_tx, mut audio_in_rx) = mpsc::channel::<OpusFrame>(64);
-    let (msg_in_tx, msg_in_rx) = mpsc::channel::<String>(8);
-    let (hangup_tx, hangup_rx) = mpsc::channel::<()>(1);
+    let (msg_in_tx, mut msg_in_rx) = mpsc::channel::<String>(8);
+    let (hangup_tx, hangup) = mpsc::channel::<()>(1);
 
-    // Inbound pump: opened frames -> engine playback. The outbound capture pump
-    // and TUI wiring (PTT capture source, text input, hangup, inbound-msg
-    // display) are owned by the UI loop in a fuller build; the *producing*
-    // halves the loop does not own (audio_out_tx, msg_out_tx, hangup_tx) and the
-    // inbound-msg *receiver* (msg_in_rx) are parked on this task so the channels
-    // stay open for the lifetime of the call instead of being dropped/leaked.
-    tokio::spawn(async move {
-        let _parked = (audio_out_tx, msg_out_tx, hangup_tx, msg_in_rx);
+    let io = CallIo {
+        audio_out,
+        msg_out,
+        audio_in: audio_in_tx,
+        msg_in: msg_in_tx,
+        hangup,
+    };
+
+    let call = tokio::spawn(run_call(conn, keys, role, peer.clone(), io));
+
+    // Inbound audio pump: opened frames -> playback engine (decode + jitter).
+    // The engine is shared so the UI loop can also start/stop capture.
+    let engine = std::sync::Arc::new(std::sync::Mutex::new(engine));
+    let play_engine = engine.clone();
+    let playback = tokio::spawn(async move {
         while let Some(frame) = audio_in_rx.recv().await {
-            if let Err(e) = engine.play(frame) {
+            // play() takes &self; lock only to access the shared engine handle.
+            let res = play_engine.lock().expect("engine lock").play(frame);
+            if let Err(e) = res {
                 tracing::warn!(error = %e, "playback enqueue failed");
             }
         }
-        drop(_parked);
     });
 
-    Ok(CallIo {
-        audio_out: audio_out_rx,
-        msg_out: msg_out_rx,
-        audio_in: audio_in_tx,
-        msg_in: msg_in_tx,
-        hangup: hangup_rx,
-    })
+    // Enter the terminal UI.
+    let mut tui = Tui::enter(cfg)?;
+    let mut screen = CallScreen::from_peer(cfg, local_onion, &peer);
+    let mut ui = tui.spawn(screen.clone());
+
+    // Outbound capture pump task handle; present only while PTT is held.
+    let mut capture_task: Option<tokio::task::JoinHandle<()>> = None;
+
+    // The interactive event loop. Ends when the user hangs up, the peer drops
+    // (call task finishes), or the UI input stream closes.
+    let outcome = loop {
+        tokio::select! {
+            ev = ui.next_event() => {
+                match ev {
+                    Some(UiEvent::PttStart) => {
+                        if capture_task.is_none() {
+                            // Begin capture and forward encoded frames to the wire.
+                            let rx = {
+                                let mut eng = engine.lock().expect("engine lock");
+                                eng.capture()
+                            };
+                            match rx {
+                                Ok(mut rx) => {
+                                    let out = audio_out_tx.clone();
+                                    capture_task = Some(tokio::spawn(async move {
+                                        while let Some(frame) = rx.recv().await {
+                                            if out.send(frame).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }));
+                                    screen.local_ptt = true;
+                                    ui.render(screen.clone());
+                                }
+                                Err(e) => tracing::warn!(error = %e, "capture start failed"),
+                            }
+                        }
+                    }
+                    Some(UiEvent::PttStop) => {
+                        if let Some(t) = capture_task.take() {
+                            t.abort();
+                        }
+                        let _ = engine.lock().expect("engine lock").stop_capture();
+                        screen.local_ptt = false;
+                        ui.render(screen.clone());
+                    }
+                    Some(UiEvent::SendText(text)) => {
+                        let _ = msg_out_tx.send(text).await;
+                    }
+                    Some(UiEvent::Hangup) | None => {
+                        let _ = hangup_tx.send(()).await;
+                        break Ok(());
+                    }
+                }
+            }
+            msg = msg_in_rx.recv() => {
+                if let Some(text) = msg {
+                    // Surface the inbound message on the screen's compose line
+                    // area; a fuller build keeps a scrollback log.
+                    screen.compose_buffer = format!("peer: {text}");
+                    ui.render(screen.clone());
+                }
+            }
+        }
+
+        // If the call core has finished (peer hung up / error), stop.
+        if call.is_finished() {
+            break Ok(());
+        }
+    };
+
+    // Wind everything down.
+    if let Some(t) = capture_task.take() {
+        t.abort();
+    }
+    let _ = engine.lock().expect("engine lock").stop_capture();
+    ui.shutdown();
+    drop(ui);
+    drop(tui); // restores the terminal
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), call).await;
+    playback.abort();
+
+    outcome
 }
 
 /// Run the full pipelined call loop over `conn` with derived `keys`.

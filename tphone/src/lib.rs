@@ -14,5 +14,6 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod proto;
+pub mod selftest;
 pub mod transport;
 pub mod tui;

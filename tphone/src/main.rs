@@ -1,13 +1,14 @@
 //! TerminalPhone v2 entry point (ARCHITECTURE "main.rs").
 //!
-//! Parses subcommands (`host`, `dial <onion>`), installs the rustls ring crypto
-//! provider, initializes tracing, builds the Tokio runtime, and hands off to
-//! [`app::App::run`].
+//! Parses subcommands (`host`, `dial <onion>`, `selftest`), installs the rustls
+//! ring crypto provider, initializes tracing, builds the Tokio runtime, and
+//! hands off to [`app::App::run`] (or the headless [`selftest`]).
 
 use tphone::app::{App, Command};
 use tphone::config::{self, Config};
 use tphone::crypto::Psk;
 use tphone::error::Result;
+use tphone::selftest;
 use tphone::transport::{ArtiTransport, OnionAddr};
 
 const USAGE: &str = "\
@@ -16,14 +17,26 @@ terminalphone — anonymous E2E push-to-talk over Tor
 USAGE:
     terminalphone host
     terminalphone dial <onion>
+    terminalphone selftest
 
 COMMANDS:
     host            Host an onion service and wait for a caller.
     dial <onion>    Dial a remote .onion and start a call.
+    selftest        Run a headless integrated loopback self-test (no Tor/audio).
 
 OPTIONS:
     -h, --help      Print this help.
 ";
+
+/// Parsed CLI action.
+enum Action {
+    /// Run a real call (host or dial) over the arti transport + TUI.
+    Call(Command),
+    /// Run the headless integrated self-test.
+    SelfTest,
+    /// Print usage and exit 0.
+    Usage,
+}
 
 fn main() {
     // rustls 0.23+ won't pick a crypto backend implicitly; install ring once at startup.
@@ -38,18 +51,19 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let cmd = match parse_args() {
-        Ok(Some(cmd)) => cmd,
-        Ok(None) => {
-            print!("{USAGE}");
-            return;
-        }
+    let action = match parse_args() {
+        Ok(a) => a,
         Err(msg) => {
             eprintln!("error: {msg}\n");
             print!("{USAGE}");
             std::process::exit(2);
         }
     };
+
+    if let Action::Usage = action {
+        print!("{USAGE}");
+        return;
+    }
 
     // Multi-threaded Tokio runtime hosts arti and the async core.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -63,36 +77,51 @@ fn main() {
         }
     };
 
-    if let Err(e) = runtime.block_on(run(cmd)) {
+    let result = runtime.block_on(run(action));
+    if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
 
-/// Parse `std::env` args into a [`Command`]. `Ok(None)` means "print usage".
-fn parse_args() -> std::result::Result<Option<Command>, String> {
+/// Parse `std::env` args into an [`Action`].
+fn parse_args() -> std::result::Result<Action, String> {
     let mut args = std::env::args().skip(1);
     let sub = match args.next() {
         Some(s) => s,
-        None => return Ok(None),
+        None => return Ok(Action::Usage),
     };
 
     match sub.as_str() {
-        "-h" | "--help" | "help" => Ok(None),
-        "host" => Ok(Some(Command::Host)),
+        "-h" | "--help" | "help" => Ok(Action::Usage),
+        "selftest" => Ok(Action::SelfTest),
+        "host" => Ok(Action::Call(Command::Host)),
         "dial" => {
             let onion = args
                 .next()
                 .ok_or_else(|| "`dial` requires an <onion> argument".to_string())?;
             let addr = OnionAddr::parse(&onion).map_err(|e| e.to_string())?;
-            Ok(Some(Command::Dial(addr)))
+            Ok(Action::Call(Command::Dial(addr)))
         }
         other => Err(format!("unknown command `{other}`")),
     }
 }
 
+/// Dispatch the parsed action.
+async fn run(action: Action) -> Result<()> {
+    match action {
+        Action::Usage => Ok(()),
+        Action::SelfTest => {
+            selftest::run().await?;
+            println!("selftest: OK — tone + message round-tripped exactly");
+            Ok(())
+        }
+        Action::Call(cmd) => run_call(cmd).await,
+    }
+}
+
 /// Resolve config + PSK and run one call over the arti transport.
-async fn run(cmd: Command) -> Result<()> {
+async fn run_call(cmd: Command) -> Result<()> {
     let data_dir = config::default_data_dir();
     let cfg = Config::load(&data_dir).unwrap_or_default();
     let psk = load_or_init_psk(&cfg)?;
