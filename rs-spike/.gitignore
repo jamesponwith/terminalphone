@@ -1,0 +1,4 @@
+/target
+.arti-*
+*.out
+*.err
