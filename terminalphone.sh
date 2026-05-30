@@ -85,14 +85,26 @@ elif [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 
 # Ensure Homebrew is in PATH on macOS (Apple Silicon: /opt/homebrew, Intel: /usr/local)
+# BREW_ARCH holds an "arch -arch" prefix so brew runs under the architecture that
+# matches its prefix. This avoids the "Cannot install under Rosetta 2 in ARM default
+# prefix" error when the script itself is launched as an x86_64 (Rosetta) process.
+BREW_ARCH=""
 if [ $IS_MACOS -eq 1 ]; then
     for _brew_prefix in /opt/homebrew /usr/local; do
         if [ -x "$_brew_prefix/bin/brew" ]; then
             export PATH="$_brew_prefix/bin:$_brew_prefix/sbin:$PATH"
+            # /opt/homebrew is the ARM prefix; force arm64 so a Rosetta shell can still use it.
+            if [ "$_brew_prefix" = "/opt/homebrew" ] && [ "$(uname -m)" = "x86_64" ]; then
+                BREW_ARCH="arch -arm64"
+            fi
             break
         fi
     done
 fi
+# Run brew under the correct architecture (no-op prefix when BREW_ARCH is empty).
+brew_run() {
+    $BREW_ARCH brew "$@"
+}
 
 # State
 TOR_PID=""
@@ -119,6 +131,7 @@ file_size() {
 
 cleanup() {
     # Restore terminal
+    printf '\033[?25h' 2>/dev/null || true  # ensure cursor is visible again
     if [ -n "$ORIGINAL_STTY" ]; then
         stty "$ORIGINAL_STTY" 2>/dev/null || true
     fi
@@ -353,6 +366,9 @@ install_deps() {
             for _brew_prefix in /opt/homebrew /usr/local; do
                 if [ -x "$_brew_prefix/bin/brew" ]; then
                     export PATH="$_brew_prefix/bin:$_brew_prefix/sbin:$PATH"
+                    if [ "$_brew_prefix" = "/opt/homebrew" ] && [ "$(uname -m)" = "x86_64" ]; then
+                        BREW_ARCH="arch -arm64"
+                    fi
                     break
                 fi
             done
@@ -364,7 +380,8 @@ install_deps() {
             log_ok "Homebrew installed"
         fi
         log_info "Installing dependencies via Homebrew..."
-        brew install $pkg_names_brew
+        [ -n "$BREW_ARCH" ] && log_info "Running brew under arm64 (Rosetta shell detected)"
+        brew_run install $pkg_names_brew
     elif check_dep apt-get; then
         log_info "Detected apt package manager"
         $SUDO apt-get update -qq
@@ -498,7 +515,7 @@ install_snowflake() {
     if [ $IS_TERMUX -eq 1 ]; then
         pkg install -y snowflake-client
     elif check_dep brew; then
-        brew install snowflake
+        brew_run install snowflake
     elif check_dep apt-get; then
         $SUDO apt-get update -qq
         $SUDO apt-get install -y snowflake-client
@@ -2518,68 +2535,85 @@ settings_chime() {
 # SETTINGS MENU
 #=============================================================================
 
+# Draw the settings header (title + current-value summary).
+_settings_menu_header() {
+    clear
+    echo -e "\n${BOLD}${CYAN}═══ Settings ═══${NC}\n"
+    echo -e "  ${DIM}Current Opus bitrate: ${NC}${WHITE}${OPUS_BITRATE} kbps${NC}"
+    echo -e "  ${DIM}Current Opus frame:   ${NC}${WHITE}${OPUS_FRAMESIZE} ms${NC}"
+
+    local al_label="${RED}disabled${NC}"
+    if [ "$AUTO_LISTEN" -eq 1 ]; then
+        al_label="${GREEN}enabled${NC}"
+    fi
+    echo -e "  ${DIM}Auto-listen:          ${NC}${al_label}"
+
+    local ptt_display="SPACE"
+    [ "$PTT_KEY" != " " ] && ptt_display="$PTT_KEY"
+    echo -e "  ${DIM}PTT key:              ${NC}${WHITE}${ptt_display}${NC}"
+
+    local vfx_display="${VOICE_EFFECT}"
+    [ "$vfx_display" = "none" ] && vfx_display="off"
+    echo -e "  ${DIM}Voice effect:          ${NC}${WHITE}${vfx_display}${NC}"
+
+    if [ $IS_TERMUX -eq 1 ]; then
+        local vp_label="${RED}disabled${NC}"
+        if [ "$VOL_PTT" -eq 1 ]; then
+            vp_label="${GREEN}enabled${NC}"
+        fi
+        echo -e "  ${DIM}Volume PTT:            ${NC}${vp_label}  ${DIM}(experimental)${NC}"
+    fi
+
+    local circ_label="${RED}disabled${NC}"
+    if [ "$SHOW_CIRCUIT" -eq 1 ]; then
+        circ_label="${GREEN}enabled${NC}"
+    fi
+    echo -e "  ${DIM}Circuit display:      ${NC}${circ_label}"
+
+    local hmac_label="${RED}disabled${NC}"
+    if [ "$HMAC_AUTH" -eq 1 ]; then
+        hmac_label="${GREEN}enabled${NC}"
+    fi
+    echo -e "  ${DIM}HMAC auth:            ${NC}${hmac_label}"
+
+    local chime_label="${RED}off${NC}"
+    if [ "$PTT_CHIME" != "off" ]; then
+        chime_label="${GREEN}${PTT_CHIME}${NC}"
+    fi
+    echo -e "  ${DIM}PTT chime:            ${NC}${chime_label}"
+    echo ""
+}
+
 settings_menu() {
+    _MENU_HEADER_FN="_settings_menu_header"
+    _MENU_POLL_FN=""
+    _MENU_POLL_TIMEOUT=""
+
     while true; do
-        clear
-        echo -e "\n${BOLD}${CYAN}═══ Settings ═══${NC}\n"
-        echo -e "  ${DIM}Current Opus bitrate: ${NC}${WHITE}${OPUS_BITRATE} kbps${NC}"
-        echo -e "  ${DIM}Current Opus frame:   ${NC}${WHITE}${OPUS_FRAMESIZE} ms${NC}"
-
-        local al_label="${RED}disabled${NC}"
-        if [ "$AUTO_LISTEN" -eq 1 ]; then
-            al_label="${GREEN}enabled${NC}"
-        fi
-        echo -e "  ${DIM}Auto-listen:          ${NC}${al_label}"
-
-        local ptt_display="SPACE"
-        [ "$PTT_KEY" != " " ] && ptt_display="$PTT_KEY"
-        echo -e "  ${DIM}PTT key:              ${NC}${WHITE}${ptt_display}${NC}"
-
-        local vfx_display="${VOICE_EFFECT}"
-        [ "$vfx_display" = "none" ] && vfx_display="off"
-        echo -e "  ${DIM}Voice effect:          ${NC}${WHITE}${vfx_display}${NC}"
-
+        # Rebuild the item list each pass (the Volume PTT entry is Termux-only).
+        _MENU_KEYS=(1 2 3 4)
+        _MENU_LABELS=(
+            "Change Opus encoding quality"
+            "Auto-listen (listen for calls automatically once Tor starts)"
+            "Change PTT (push-to-talk) key"
+            "Voice changer"
+        )
         if [ $IS_TERMUX -eq 1 ]; then
-            local vp_label="${RED}disabled${NC}"
-            if [ "$VOL_PTT" -eq 1 ]; then
-                vp_label="${GREEN}enabled${NC}"
-            fi
-            echo -e "  ${DIM}Volume PTT:            ${NC}${vp_label}  ${DIM}(experimental)${NC}"
+            _MENU_KEYS+=(5)
+            _MENU_LABELS+=("Volume PTT ${DIM}(double-tap Vol Down to talk, experimental)${NC}")
         fi
+        _MENU_KEYS+=(6 7 8 0)
+        _MENU_LABELS+=(
+            "PTT chime ${DIM}(notification sound when remote starts recording)${NC}"
+            "Tor settings"
+            "Security"
+            "${DIM}Back to main menu${NC}"
+        )
 
-        local circ_label="${RED}disabled${NC}"
-        if [ "$SHOW_CIRCUIT" -eq 1 ]; then
-            circ_label="${GREEN}enabled${NC}"
-        fi
-        echo -e "  ${DIM}Circuit display:      ${NC}${circ_label}"
+        interactive_menu
+        local schoice="$MENU_CHOICE"
 
-        local hmac_label="${RED}disabled${NC}"
-        if [ "$HMAC_AUTH" -eq 1 ]; then
-            hmac_label="${GREEN}enabled${NC}"
-        fi
-        echo -e "  ${DIM}HMAC auth:            ${NC}${hmac_label}"
-
-        local chime_label="${RED}off${NC}"
-        if [ "$PTT_CHIME" != "off" ]; then
-            chime_label="${GREEN}${PTT_CHIME}${NC}"
-        fi
-        echo -e "  ${DIM}PTT chime:            ${NC}${chime_label}"
-        echo ""
-
-        echo -e "  ${BOLD}${WHITE}1${NC} ${CYAN}│${NC} Change Opus encoding quality"
-        echo -e "  ${BOLD}${WHITE}2${NC} ${CYAN}│${NC} Auto-listen (listen for calls automatically once Tor starts)"
-        echo -e "  ${BOLD}${WHITE}3${NC} ${CYAN}│${NC} Change PTT (push-to-talk) key"
-        echo -e "  ${BOLD}${WHITE}4${NC} ${CYAN}│${NC} Voice changer"
-        if [ $IS_TERMUX -eq 1 ]; then
-            echo -e "  ${BOLD}${WHITE}5${NC} ${CYAN}│${NC} Volume PTT ${DIM}(double-tap Vol Down to talk, experimental)${NC}"
-        fi
-        echo -e "  ${BOLD}${WHITE}6${NC} ${CYAN}│${NC} PTT chime ${DIM}(notification sound when remote starts recording)${NC}"
-        echo -e "  ${BOLD}${WHITE}7${NC} ${CYAN}│${NC} Tor settings"
-        echo -e "  ${BOLD}${WHITE}8${NC} ${CYAN}│${NC} Security"
-        echo -e "  ${BOLD}${WHITE}0${NC} ${CYAN}│${NC} ${DIM}Back to main menu${NC}"
-        echo ""
-        echo -ne "  ${BOLD}Select: ${NC}"
-        read -r schoice
+        [ -z "$schoice" ] && continue
 
         case "$schoice" in
             1) settings_opus ;;
@@ -3436,6 +3470,195 @@ settings_hmac() {
 }
 
 #=============================================================================
+# INTERACTIVE MENU ENGINE
+#=============================================================================
+# A reusable arrow-key/number-key menu selector.
+#
+# Callers set these globals before calling interactive_menu:
+#   _MENU_KEYS      (array)  — the key each item maps to (e.g. 1 2 .. 13 0).
+#                             interactive_menu returns the chosen key in
+#                             MENU_CHOICE, so existing `case "$choice"` blocks
+#                             keep working unchanged.
+#   _MENU_LABELS    (array)  — display text for each item (may contain colour
+#                             escapes — rendered with `echo -e`). Same length
+#                             as _MENU_KEYS.
+#   _MENU_HEADER_FN (string) — optional function name that draws the screen
+#                             header (should clear the screen first).
+#   _MENU_POLL_FN   (string) — optional function name polled while idle. If it
+#                             returns 0, interactive_menu returns with an empty
+#                             MENU_CHOICE (the poll handled the event).
+#   _MENU_POLL_TIMEOUT (str) — read timeout in seconds used when polling.
+#
+# Navigation: ↑/↓ or k/j move, Enter selects, q/Q quits, or type the number
+# (multi-digit supported) and press Enter — matching the old typed behaviour.
+
+# Put the terminal into single-key, no-echo mode for the menu, and back.
+# interactive_menu owns the original tty settings in _MENU_STTY_SAVED.
+_menu_raw_on() {
+    printf '\033[?25l'  # hide cursor
+    stty -icanon -echo min 1 time 0 2>/dev/null || true
+}
+_menu_raw_off() {
+    if [ -n "${_MENU_STTY_SAVED:-}" ]; then
+        stty "$_MENU_STTY_SAVED" 2>/dev/null || true
+    else
+        stty sane 2>/dev/null || true
+    fi
+    printf '\033[?25h'  # show cursor
+}
+
+# Read a single keypress into the global KEY. Recognises arrow keys, Enter,
+# and Backspace. With an integer-seconds argument it polls (KEY=TIMEOUT on
+# idle). The terminal must already be in -icanon -echo mode (see _menu_raw_on);
+# we read raw bytes with dd and rely on VMIN/VTIME so it works on bash 3.2
+# (macOS) where fractional `read -t` is unsupported.
+_read_key() {
+    local timeout="${1:-}" k rest t10
+    KEY=""
+
+    if [ -n "$timeout" ]; then
+        t10=$(( timeout * 10 ))            # stty VTIME is in tenths of a second
+        [ "$t10" -gt 255 ] && t10=255
+        stty min 0 time "$t10" 2>/dev/null || true
+        k=$(dd bs=1 count=1 2>/dev/null; echo x); k="${k%x}"
+        stty min 1 time 0 2>/dev/null || true
+        [ -z "$k" ] && { KEY="TIMEOUT"; return 0; }
+    else
+        k=$(dd bs=1 count=1 2>/dev/null; echo x); k="${k%x}"
+        [ -z "$k" ] && { KEY="EOF"; return 0; }
+    fi
+
+    case "$k" in
+        $'\r'|$'\n') KEY="ENTER"; return 0 ;;
+        $'\e')
+            # Grab the rest of the escape sequence with a brief VTIME timeout so
+            # a lone Esc doesn't block waiting for bytes that never arrive.
+            stty min 0 time 2 2>/dev/null || true
+            rest=$(dd bs=2 count=1 2>/dev/null; echo x); rest="${rest%x}"
+            stty min 1 time 0 2>/dev/null || true
+            case "$rest" in
+                '[A'|'OA') KEY="UP" ;;
+                '[B'|'OB') KEY="DOWN" ;;
+                '[C'|'OC') KEY="RIGHT" ;;
+                '[D'|'OD') KEY="LEFT" ;;
+                *)         KEY="ESC" ;;
+            esac
+            return 0 ;;
+        $'\x7f'|$'\b') KEY="BACKSPACE"; return 0 ;;
+        *) KEY="$k"; return 0 ;;
+    esac
+}
+
+# Find the item whose key exactly equals "$1"; sets _MENU_MATCH_IDX, returns 0.
+_menu_match_buffer() {
+    local b="$1" i
+    for i in "${!_MENU_KEYS[@]}"; do
+        if [ "${_MENU_KEYS[$i]}" = "$b" ]; then _MENU_MATCH_IDX=$i; return 0; fi
+    done
+    return 1
+}
+
+# Return 0 if some key has "$1" as a prefix (so the digit buffer can grow).
+_menu_prefix_exists() {
+    local b="$1" i
+    for i in "${!_MENU_KEYS[@]}"; do
+        case "${_MENU_KEYS[$i]}" in "$b"*) return 0 ;; esac
+    done
+    return 1
+}
+
+# Draw (or redraw in place) the menu items + hint line.
+_menu_draw() {
+    local sel="$1" buffer="$2" i key label numpad
+    for i in "${!_MENU_LABELS[@]}"; do
+        key="${_MENU_KEYS[$i]}"
+        label="${_MENU_LABELS[$i]}"
+        printf -v numpad '%-2s' "$key"
+        printf '\r\033[K'
+        if [ "$i" -eq "$sel" ]; then
+            echo -e "  ${GREEN}${BOLD}▶${NC} ${GREEN}${BOLD}${numpad}${NC}${CYAN}│${NC} ${BOLD}${label}${NC}"
+        else
+            echo -e "    ${WHITE}${BOLD}${numpad}${NC}${CYAN}│${NC} ${label}"
+        fi
+    done
+    printf '\r\033[K'
+    local bufinfo=""
+    [ -n "$buffer" ] && bufinfo="   ${YELLOW}${BOLD}▸ ${buffer}${NC}"
+    echo -e "  ${DIM}↑/↓ move · enter select · type number · q quit${NC}${bufinfo}"
+}
+
+# The selector loop. Returns the chosen key in MENU_CHOICE (or "" if a poll
+# event was handled, or "q" to quit).
+interactive_menu() {
+    local n=${#_MENU_KEYS[@]}
+    local sel=0 buffer="" lines=$(( ${#_MENU_LABELS[@]} + 1 ))
+    local poll_fn="${_MENU_POLL_FN:-}" poll_to="${_MENU_POLL_TIMEOUT:-}"
+    MENU_CHOICE=""
+
+    _MENU_STTY_SAVED=$(stty -g 2>/dev/null) || _MENU_STTY_SAVED=""
+    _menu_raw_on
+    [ -n "${_MENU_HEADER_FN:-}" ] && "$_MENU_HEADER_FN"
+    _menu_draw "$sel" "$buffer"
+
+    while true; do
+        if [ -n "$poll_fn" ]; then
+            _read_key "$poll_to"
+        else
+            _read_key ""
+        fi
+
+        case "$KEY" in
+            TIMEOUT)
+                # Restore the terminal before running the poll handler (it may
+                # take over the screen), then re-arm raw mode if nothing fired.
+                _menu_raw_off
+                if [ -n "$poll_fn" ] && "$poll_fn"; then
+                    MENU_CHOICE=""
+                    return 0
+                fi
+                _menu_raw_on
+                continue
+                ;;
+            EOF)
+                _menu_raw_off
+                MENU_CHOICE="q"
+                echo ""
+                return 0
+                ;;
+            UP|k)   buffer=""; sel=$(( (sel - 1 + n) % n )) ;;
+            DOWN|j) buffer=""; sel=$(( (sel + 1) % n )) ;;
+            ENTER)
+                _menu_raw_off
+                if [ -n "$buffer" ]; then MENU_CHOICE="$buffer"; else MENU_CHOICE="${_MENU_KEYS[$sel]}"; fi
+                echo ""
+                return 0
+                ;;
+            q|Q)
+                _menu_raw_off
+                MENU_CHOICE="q"
+                echo ""
+                return 0
+                ;;
+            BACKSPACE)
+                buffer="${buffer%?}"
+                _menu_match_buffer "$buffer" && sel=$_MENU_MATCH_IDX
+                ;;
+            [0-9])
+                local nb="${buffer}${KEY}"
+                if _menu_prefix_exists "$nb"; then buffer="$nb"; else buffer="$KEY"; fi
+                _menu_match_buffer "$buffer" && sel=$_MENU_MATCH_IDX
+                ;;
+            *)
+                continue  # ignore unrecognised keys (no redraw needed)
+                ;;
+        esac
+
+        printf '\033[%dA' "$lines"  # move cursor back up to first item
+        _menu_draw "$sel" "$buffer"
+    done
+}
+
+#=============================================================================
 # MAIN MENU
 #=============================================================================
 
@@ -3453,67 +3676,69 @@ show_banner() {
     echo -e "  ${DIM}v${VERSION} | Push-to-Talk | End-to-End ${cipher_display}${NC}\n"
 }
 
+# Draw the banner + quick status line for the main menu.
+_main_menu_header() {
+    show_banner
+
+    # Show quick status line
+    local tor_status="${RED}●${NC}"
+    if [ -n "$TOR_PID" ] && kill -0 "$TOR_PID" 2>/dev/null; then
+        tor_status="${GREEN}●${NC}"
+    fi
+    local secret_status="${RED}●${NC}"
+    if [ -n "$SHARED_SECRET" ]; then
+        secret_status="${GREEN}●${NC}"
+    fi
+    local sf_status="${RED}●${NC}"
+    if [ "$SNOWFLAKE_ENABLED" -eq 1 ]; then
+        sf_status="${GREEN}●${NC}"
+    fi
+    local al_status="${RED}●${NC}"
+    if [ "$AUTO_LISTEN" -eq 1 ]; then
+        al_status="${GREEN}●${NC}"
+    fi
+    local _ptt_d="SPACE"
+    [ "$PTT_KEY" != " " ] && _ptt_d="$PTT_KEY"
+
+    echo -e "  ${DIM}Tor:${NC} $tor_status  ${DIM}Secret:${NC} $secret_status  ${DIM}SF:${NC} $sf_status  ${DIM}AL:${NC} $al_status  ${DIM}PTT:${NC} ${GREEN}[${_ptt_d}]${NC}"
+    if [ "$AUTO_LISTEN" -eq 1 ] && [ -n "$AUTO_LISTEN_PID" ]; then
+        echo -e "  ${DIM}[Auto-listening for incoming calls...]${NC}"
+    fi
+    echo ""
+}
+
 main_menu() {
+    _MENU_KEYS=(1 2 3 4 5 6 7 8 9 10 11 12 13 0)
+    _MENU_LABELS=(
+        "Listen for calls"
+        "Call an onion address"
+        "Show my onion address"
+        "Set shared secret"
+        "Test audio (loopback)"
+        "Show status"
+        "Install dependencies"
+        "Start Tor"
+        "Stop Tor"
+        "Restart Tor"
+        "Rotate onion address"
+        "Settings"
+        "Relay mode (group bridge)"
+        "${RED}Quit${NC}"
+    )
+    _MENU_HEADER_FN="_main_menu_header"
+
     while true; do
-        show_banner
-
-        # Show quick status line
-        local tor_status="${RED}●${NC}"
-        if [ -n "$TOR_PID" ] && kill -0 "$TOR_PID" 2>/dev/null; then
-            tor_status="${GREEN}●${NC}"
-        fi
-        local secret_status="${RED}●${NC}"
-        if [ -n "$SHARED_SECRET" ]; then
-            secret_status="${GREEN}●${NC}"
-        fi
-        local sf_status="${RED}●${NC}"
-        if [ "$SNOWFLAKE_ENABLED" -eq 1 ]; then
-            sf_status="${GREEN}●${NC}"
-        fi
-        local al_status="${RED}●${NC}"
-        if [ "$AUTO_LISTEN" -eq 1 ]; then
-            al_status="${GREEN}●${NC}"
-        fi
-        local _ptt_d="SPACE"
-        [ "$PTT_KEY" != " " ] && _ptt_d="$PTT_KEY"
-
-        echo -e "  ${DIM}Tor:${NC} $tor_status  ${DIM}Secret:${NC} $secret_status  ${DIM}SF:${NC} $sf_status  ${DIM}AL:${NC} $al_status  ${DIM}PTT:${NC} ${GREEN}[${_ptt_d}]${NC}\n"
-
-        echo -e "  ${BOLD}${WHITE}1${NC} ${CYAN}│${NC} Listen for calls"
-        echo -e "  ${BOLD}${WHITE}2${NC} ${CYAN}│${NC} Call an onion address"
-        echo -e "  ${BOLD}${WHITE}3${NC} ${CYAN}│${NC} Show my onion address"
-        echo -e "  ${BOLD}${WHITE}4${NC} ${CYAN}│${NC} Set shared secret"
-        echo -e "  ${BOLD}${WHITE}5${NC} ${CYAN}│${NC} Test audio (loopback)"
-        echo -e "  ${BOLD}${WHITE}6${NC} ${CYAN}│${NC} Show status"
-        echo -e "  ${BOLD}${WHITE}7${NC} ${CYAN}│${NC} Install dependencies"
-        echo -e "  ${BOLD}${WHITE}8${NC} ${CYAN}│${NC} Start Tor"
-        echo -e "  ${BOLD}${WHITE}9${NC} ${CYAN}│${NC} Stop Tor"
-        echo -e "  ${BOLD}${WHITE}10${NC}${CYAN}│${NC} Restart Tor"
-        echo -e "  ${BOLD}${WHITE}11${NC}${CYAN}│${NC} Rotate onion address"
-        echo -e "  ${BOLD}${WHITE}12${NC}${CYAN}│${NC} Settings"
-        echo -e "  ${BOLD}${WHITE}13${NC}${CYAN}│${NC} Relay mode (group bridge)"
-        echo -e "  ${BOLD}${WHITE}0${NC} ${CYAN}│${NC} ${RED}Quit${NC}"
-        echo ""
-        echo -ne "  ${BOLD}Select: ${NC}"
-
-        # If auto-listen is active, poll for incoming calls without redrawing
-        local choice=""
+        # If auto-listen is active, poll for incoming calls while idle.
         if [ "$AUTO_LISTEN" -eq 1 ] && [ -n "$AUTO_LISTEN_PID" ]; then
-            echo -ne "${DIM}[Auto-listening...]${NC} " >&2
-            while true; do
-                # Check for incoming call
-                if check_auto_listen; then
-                    choice=""
-                    break
-                fi
-                # Try to read user input with short timeout
-                if read -r -t 1 choice 2>/dev/null; then
-                    break  # user typed something
-                fi
-            done
+            _MENU_POLL_FN="check_auto_listen"
+            _MENU_POLL_TIMEOUT="1"
         else
-            read -r choice
+            _MENU_POLL_FN=""
+            _MENU_POLL_TIMEOUT=""
         fi
+
+        interactive_menu
+        local choice="$MENU_CHOICE"
 
         [ -z "$choice" ] && continue
 
@@ -3550,7 +3775,7 @@ main_menu() {
                                 SUDO=""
                                 pkg install -y libqrencode 2>/dev/null
                             elif check_dep brew; then
-                                brew install qrencode 2>/dev/null
+                                brew_run install qrencode 2>/dev/null
                             elif check_dep apt-get; then
                                 $SUDO apt-get install -y qrencode 2>/dev/null
                             elif check_dep dnf; then
