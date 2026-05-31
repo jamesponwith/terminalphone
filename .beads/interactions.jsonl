@@ -15,3 +15,4 @@
 {"id":"int-00037e21","kind":"field_change","created_at":"2026-05-31T18:16:15.31053Z","actor":"phall1","issue_id":"tp-148","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
 {"id":"int-948cf0f9","kind":"field_change","created_at":"2026-05-31T18:16:48.805487Z","actor":"phall1","issue_id":"tp-1cn","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
 {"id":"int-3a312447","kind":"field_change","created_at":"2026-05-31T18:17:47.110932Z","actor":"phall1","issue_id":"tp-hlv","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
+{"id":"int-5fe95d15","kind":"field_change","created_at":"2026-05-31T18:38:22.527269Z","actor":"phall1","issue_id":"tp-0lz","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}

@@ -314,6 +314,11 @@ async fn run_interactive(
                         ui.render(screen.clone());
                     }
                     Some(UiEvent::SendText(text)) => {
+                        screen.messages.push(format!("you : {text}"));
+                        if screen.messages.len() > 100 {
+                            screen.messages.remove(0);
+                        }
+                        ui.render(screen.clone());
                         let _ = msg_out_tx.send(text).await;
                     }
                     Some(UiEvent::Hangup) | None => {
@@ -324,9 +329,12 @@ async fn run_interactive(
             }
             msg = msg_in_rx.recv() => {
                 if let Some(text) = msg {
-                    // Surface the inbound message on the screen's compose line
-                    // area; a fuller build keeps a scrollback log.
-                    screen.compose_buffer = format!("peer: {text}");
+                    // Add message to history and re-render.
+                    screen.messages.push(format!("peer: {text}"));
+                    // Keep message history bounded to avoid unbounded growth.
+                    if screen.messages.len() > 100 {
+                        screen.messages.remove(0);
+                    }
                     ui.render(screen.clone());
                 }
             }

@@ -215,6 +215,8 @@ pub struct CallScreen {
     pub composing: bool,
     /// The in-progress compose buffer (shown after the prompt).
     pub compose_buffer: String,
+    /// Recent messages in the call (one per line, newest last). Truncated to fit screen.
+    pub messages: Vec<String>,
 }
 
 impl Default for CallScreen {
@@ -232,6 +234,7 @@ impl Default for CallScreen {
             bytes_recv: 0,
             composing: false,
             compose_buffer: String::new(),
+            messages: Vec::new(),
         }
     }
 }
@@ -487,8 +490,37 @@ fn render_screen(s: &CallScreen) -> Result<()> {
             .map_err(|e| io(std::io::Error::other(e)))?;
     }
 
+    // Message area: display recent messages between header and footer.
+    // Reserve 2 rows for footer (footer + blank line).
+    let header_end = header.len() as u16;
+    let footer_row = if let Ok((_, height)) = crossterm::terminal::size() {
+        if height > 10 { height - 2 } else { header_end + 2 }
+    } else {
+        header_end + 5
+    };
+
+    let msg_rows = if footer_row > header_end + 1 {
+        (footer_row - header_end - 2) as usize
+    } else {
+        0
+    };
+
+    // Display the most recent messages that fit on screen.
+    if msg_rows > 0 && !s.messages.is_empty() {
+        let start_msg = s.messages.len().saturating_sub(msg_rows);
+        for (offset, msg) in s.messages[start_msg..].iter().enumerate() {
+            let row = header_end + 1 + offset as u16;
+            let truncated = if msg.len() > 78 {
+                format!("{}…", &msg[..75])
+            } else {
+                msg.clone()
+            };
+            queue!(out, MoveTo(0, row), crossterm::style::Print(&truncated))
+                .map_err(|e| io(std::io::Error::other(e)))?;
+        }
+    }
+
     // Footer: either the compose line or the key hints.
-    let footer_row = (header.len() + 1) as u16;
     let footer = if s.composing {
         format!("msg> {}", s.compose_buffer)
     } else {
