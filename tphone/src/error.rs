@@ -57,3 +57,15 @@ pub enum Error {
 
 /// Crate-wide `Result` alias bound to [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<toml::de::Error> for Error {
+    fn from(e: toml::de::Error) -> Self {
+        Error::Config(e.to_string())
+    }
+}
+
+impl From<toml::ser::Error> for Error {
+    fn from(e: toml::ser::Error) -> Self {
+        Error::Config(e.to_string())
+    }
+}

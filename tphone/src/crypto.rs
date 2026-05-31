@@ -28,12 +28,14 @@
 
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{Error, Result};
 
 /// Negotiated AEAD cipher suite (SPEC §5.2). The id is exchanged in HELLO.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AeadSuite {
     /// AES-256-GCM — default; hardware-accelerated (AES-NI / ARMv8 crypto).
     Aes256Gcm,

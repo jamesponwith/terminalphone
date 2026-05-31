@@ -7,12 +7,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::crypto::AeadSuite;
 use crate::error::Result;
 use crate::transport::TorConfig;
 
 /// Opus codec parameters (SPEC §5.4). Defaults: 16 kHz wideband mono, ~24 kbps VBR, 20 ms frames.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpusParams {
     /// Sample rate in Hz (e.g. 16000; 8000 for constrained links).
     pub sample_rate: u32,
@@ -36,7 +38,8 @@ impl Default for OpusParams {
 }
 
 /// Anonymity vs. latency posture (SPEC §5.1, ADR-0005).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SpeedMode {
     /// Full anonymity: standard 3+3 hop circuits.
     FullAnonymity,
@@ -45,6 +48,23 @@ pub enum SpeedMode {
     SpeedFirst,
     /// IP-revealing single-hop *service* mode — explicit opt-in, never silent.
     SingleHopService,
+}
+
+/// Intermediate struct for TOML deserialization (Duration handled separately).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConfigToml {
+    #[serde(default)]
+    aead_suite: Option<AeadSuite>,
+    #[serde(default)]
+    opus: Option<OpusParams>,
+    #[serde(default)]
+    ptt_key: Option<char>,
+    #[serde(default)]
+    speed_mode: Option<SpeedMode>,
+    #[serde(default)]
+    jitter_lead_ms: Option<u64>,
+    #[serde(default)]
+    app_port: Option<u16>,
 }
 
 /// Top-level user config persisted as `config.toml` (SPEC §6.2).
@@ -83,18 +103,41 @@ impl Default for Config {
 impl Config {
     /// Load config from `data_dir/config.toml`, falling back to defaults when absent.
     ///
-    /// M1 scope: the data-dir is honored (so all derived paths resolve under it)
-    /// and an absent config file yields defaults. A full TOML field parse is
-    /// deferred (no `serde`/`toml` dependency in M1); when the file exists we
-    /// currently start from defaults rooted at `data_dir`. The frozen field set
-    /// and the merge-over-defaults contract are preserved for that future parse.
+    /// Parses TOML fields: `aead_suite`, `ptt_key`, `app_port`, `speed_mode`,
+    /// `jitter_lead_ms`, and `[opus]` table (sample_rate, channels, bitrate, frame_ms).
+    /// Missing fields use [`Config::default()`] values. An absent config file is
+    /// not an error; defaults are used throughout.
     pub fn load(data_dir: &std::path::Path) -> Result<Self> {
-        let cfg = Config {
+        let path = data_dir.join("config.toml");
+        let mut cfg = Config {
             data_dir: data_dir.to_path_buf(),
             ..Config::default()
         };
-        // If a config file is present we keep defaults for now; the explicit
-        // data-dir root is the part every subsystem actually depends on in M1.
+
+        if path.exists() {
+            let content = std::fs::read_to_string(&path)?;
+            let parsed: ConfigToml = toml::from_str(&content)?;
+
+            if let Some(suite) = parsed.aead_suite {
+                cfg.aead_suite = suite;
+            }
+            if let Some(ptt) = parsed.ptt_key {
+                cfg.ptt_key = ptt;
+            }
+            if let Some(port) = parsed.app_port {
+                cfg.app_port = port;
+            }
+            if let Some(mode) = parsed.speed_mode {
+                cfg.speed_mode = mode;
+            }
+            if let Some(ms) = parsed.jitter_lead_ms {
+                cfg.jitter_lead = Duration::from_millis(ms);
+            }
+            if let Some(opus) = parsed.opus {
+                cfg.opus = opus;
+            }
+        }
+
         Ok(cfg)
     }
 
@@ -108,28 +151,17 @@ impl Config {
 
         std::fs::create_dir_all(&self.data_dir)?;
         let path = self.config_path();
-        let suite = match self.aead_suite {
-            AeadSuite::Aes256Gcm => "aes256gcm",
-            AeadSuite::ChaCha20Poly1305 => "chacha20poly1305",
-        };
-        let body = format!(
-            "# terminalphone config (M1 snapshot)\n\
-             aead_suite = \"{suite}\"\n\
-             ptt_key = \"{}\"\n\
-             app_port = {}\n\
-             [opus]\n\
-             sample_rate = {}\n\
-             channels = {}\n\
-             bitrate = {}\n\
-             frame_ms = {}\n",
-            self.ptt_key,
-            self.app_port,
-            self.opus.sample_rate,
-            self.opus.channels,
-            self.opus.bitrate,
-            self.opus.frame_ms,
-        );
 
+        let toml_data = ConfigToml {
+            aead_suite: Some(self.aead_suite),
+            ptt_key: Some(self.ptt_key),
+            app_port: Some(self.app_port),
+            speed_mode: Some(self.speed_mode),
+            jitter_lead_ms: Some(self.jitter_lead.as_millis() as u64),
+            opus: Some(self.opus),
+        };
+
+        let body = toml::to_string_pretty(&toml_data)?;
         let mut f = std::fs::File::create(&path)?;
         f.write_all(body.as_bytes())?;
         #[cfg(unix)]
@@ -177,4 +209,54 @@ pub fn default_data_dir() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".terminalphone")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn config_toml_round_trip() {
+        let tmpdir = TempDir::new().unwrap();
+        let data_dir = tmpdir.path();
+
+        let orig = Config {
+            data_dir: data_dir.to_path_buf(),
+            aead_suite: AeadSuite::ChaCha20Poly1305,
+            ptt_key: 'p',
+            app_port: 8888,
+            speed_mode: SpeedMode::FullAnonymity,
+            jitter_lead: Duration::from_millis(500),
+            opus: OpusParams {
+                sample_rate: 8_000,
+                channels: 1,
+                bitrate: 16_000,
+                frame_ms: 40,
+            },
+        };
+
+        orig.save().unwrap();
+        let loaded = Config::load(data_dir).unwrap();
+
+        assert_eq!(orig.aead_suite, loaded.aead_suite);
+        assert_eq!(orig.ptt_key, loaded.ptt_key);
+        assert_eq!(orig.app_port, loaded.app_port);
+        assert_eq!(orig.speed_mode, loaded.speed_mode);
+        assert_eq!(orig.jitter_lead, loaded.jitter_lead);
+        assert_eq!(orig.opus.sample_rate, loaded.opus.sample_rate);
+        assert_eq!(orig.opus.channels, loaded.opus.channels);
+        assert_eq!(orig.opus.bitrate, loaded.opus.bitrate);
+        assert_eq!(orig.opus.frame_ms, loaded.opus.frame_ms);
+    }
+
+    #[test]
+    fn missing_config_yields_defaults() {
+        let tmpdir = TempDir::new().unwrap();
+        let data_dir = tmpdir.path();
+
+        let cfg = Config::load(data_dir).unwrap();
+        assert_eq!(cfg.aead_suite, AeadSuite::Aes256Gcm);
+        assert_eq!(cfg.speed_mode, SpeedMode::SpeedFirst);
+    }
 }
