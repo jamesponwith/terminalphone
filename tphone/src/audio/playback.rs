@@ -20,6 +20,29 @@ use std::time::Duration;
 use crate::audio::{AudioConfig, PcmFrame};
 use crate::error::{Error, Result};
 
+/// Linear makeup gain applied to decoded audio before playout.
+///
+/// The capture→Opus→playout path is unity-gain end to end, so received audio
+/// plays back at the raw microphone level — typically −20…−30 dBFS for speech,
+/// with no AGC like phones/Zoom apply. That sounds *extremely quiet*. This
+/// constant lifts playout to a comfortable level (≈ +12 dB). It is applied with
+/// per-sample saturation so the occasional loud passage clips hard rather than
+/// wrapping around. Lower it toward `1.0` if your input is already hot; this is
+/// a deliberately simple knob (a future config/CLI option can supersede it).
+const PLAYBACK_GAIN: f32 = 4.0;
+
+/// Scale `samples` in place by `gain`, saturating at the i16 range so a boosted
+/// loud sample clips instead of wrapping. A gain of ~1.0 is a no-op fast path.
+fn apply_gain(samples: &mut [i16], gain: f32) {
+    if (gain - 1.0).abs() < f32::EPSILON {
+        return;
+    }
+    for s in samples {
+        let scaled = (*s as f32 * gain).round();
+        *s = scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+    }
+}
+
 /// Owns the cpal output stream and a small jitter buffer; playout begins once a
 /// tunable lead is buffered, then streams smoothly (SPEC §5.4).
 pub struct Playback {
@@ -66,11 +89,16 @@ impl Playback {
     /// the audio callback) — every normal enqueue succeeds; the buffer caps its
     /// own depth and drops the oldest audio on overflow rather than rejecting.
     pub fn enqueue(&self, pcm: PcmFrame) -> Result<()> {
+        // Apply makeup gain before buffering so playout is at a usable level.
+        // Done outside the lock to keep the critical section minimal.
+        let mut samples = pcm.samples;
+        apply_gain(&mut samples, PLAYBACK_GAIN);
+
         let mut buf = self
             .buffer
             .lock()
             .map_err(|_| Error::Audio("playback buffer lock poisoned".into()))?;
-        buf.push(pcm.samples);
+        buf.push(samples);
         Ok(())
     }
 }
@@ -338,6 +366,22 @@ mod tests {
         let w = jb.fill(&mut out);
         assert_eq!(w, 2);
         assert_eq!(out, [1, 2, 0]);
+    }
+
+    #[test]
+    fn apply_gain_scales_and_saturates() {
+        // Unity gain is an exact no-op.
+        let mut s = vec![100, -100, 0, 32767, -32768];
+        apply_gain(&mut s, 1.0);
+        assert_eq!(s, vec![100, -100, 0, 32767, -32768]);
+
+        // 4x boost scales quiet samples and saturates loud ones (no wraparound).
+        let mut s = vec![100, -100, 10_000, -10_000];
+        apply_gain(&mut s, 4.0);
+        assert_eq!(s, vec![400, -400, i16::MAX, i16::MIN]);
+
+        // The default playout gain is a real boost (> unity).
+        assert!(PLAYBACK_GAIN > 1.0, "playout must apply makeup gain");
     }
 
     #[test]
