@@ -202,6 +202,17 @@ async fn run_call(cmd: Command, flags: Flags) -> Result<()> {
         cfg.speed_mode = speed;
     }
 
+    // Explicit warning for the IP-revealing single-hop service mode (ADR-0005).
+    if cfg.speed_mode == config::SpeedMode::SingleHopService {
+        eprintln!(
+            "⚠️  WARNING: single-hop service mode REVEALS YOUR REAL IP ADDRESS\n\
+             Use this only if you fully understand the exposure.\n\
+             Press Ctrl-C to abort, or Enter to proceed.\n"
+        );
+        let mut confirm = String::new();
+        std::io::stdin().read_line(&mut confirm)?;
+    }
+
     let psk = load_or_init_psk(&cfg)?;
 
     let mut app = App::new(cfg, psk);
