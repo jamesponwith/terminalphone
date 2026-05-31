@@ -270,6 +270,8 @@ async fn run_interactive(
     // Enter the terminal UI.
     let mut tui = Tui::enter(cfg)?;
     let mut screen = CallScreen::from_peer(cfg, local_onion, &peer);
+    // Reflect the actual PTT gesture (hold vs tap) in the footer hint.
+    screen.ptt_hold = tui.keyboard_enhanced();
     let mut ui = tui.spawn(screen.clone());
 
     // Outbound capture pump task handle; present only while PTT is held.
@@ -314,12 +316,30 @@ async fn run_interactive(
                         ui.render(screen.clone());
                     }
                     Some(UiEvent::SendText(text)) => {
+                        // Sending ends compose mode; clear the input line.
+                        screen.composing = false;
+                        screen.compose_buffer.clear();
                         screen.messages.push(format!("you : {text}"));
                         if screen.messages.len() > 100 {
                             screen.messages.remove(0);
                         }
                         ui.render(screen.clone());
                         let _ = msg_out_tx.send(text).await;
+                    }
+                    Some(UiEvent::Compose(state)) => {
+                        // Live compose feedback: paint the in-progress line (or
+                        // clear it when compose ends).
+                        match state {
+                            Some(buf) => {
+                                screen.composing = true;
+                                screen.compose_buffer = buf;
+                            }
+                            None => {
+                                screen.composing = false;
+                                screen.compose_buffer.clear();
+                            }
+                        }
+                        ui.render(screen.clone());
                     }
                     Some(UiEvent::Hangup) | None => {
                         let _ = hangup_tx.send(()).await;

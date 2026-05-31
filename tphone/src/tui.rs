@@ -26,10 +26,11 @@ use std::time::Duration;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use crossterm::{execute, queue};
 use tokio::sync::mpsc;
@@ -51,6 +52,11 @@ pub enum UiEvent {
     PttStop,
     /// The user composed and submitted a text line; seal + send it as `MSG`.
     SendText(String),
+    /// The compose line changed: `Some(buffer)` while typing (the app should
+    /// paint the in-progress line), `None` once compose mode ends. Carries the
+    /// live buffer so the screen reflects each keystroke — without this the
+    /// reader thread's compose state would be invisible until Enter.
+    Compose(Option<String>),
     /// The user requested a graceful hangup (`q` / Ctrl-C).
     Hangup,
 }
@@ -63,6 +69,9 @@ pub struct InputState {
     /// `Some(buffer)` while the user is typing a text line (after pressing the
     /// compose key); `None` in normal PTT mode.
     compose: Option<String>,
+    /// Transmit state for *toggle* PTT (terminals that cannot report key
+    /// release): each PTT-key press flips this. Unused in hold-to-talk mode.
+    talking: bool,
 }
 
 impl InputState {
@@ -96,9 +105,14 @@ impl InputState {
 ///
 /// Key *release* events are ignored except for the PTT key (so a held PTT key is
 /// not mistaken for a quit on key-up).
+///
+/// `hold_ptt` selects the PTT model: `true` when the terminal reports key-release
+/// events (kitty keyboard protocol — hold-to-talk), `false` otherwise, where we
+/// fall back to tap-to-toggle since no release will ever arrive.
 pub fn map_key(
     state: &mut InputState,
     ptt_key: char,
+    hold_ptt: bool,
     code: KeyCode,
     modifiers: KeyModifiers,
     kind: KeyEventKind,
@@ -114,23 +128,41 @@ pub fn map_key(
     if state.compose.is_some() {
         return map_key_compose(state, code, kind);
     }
-    map_key_normal(state, ptt_key, code, kind)
+    map_key_normal(state, ptt_key, hold_ptt, code, kind)
 }
 
 /// Key mapping in normal (PTT) mode.
 fn map_key_normal(
     state: &mut InputState,
     ptt_key: char,
+    hold_ptt: bool,
     code: KeyCode,
     kind: KeyEventKind,
 ) -> Vec<UiEvent> {
-    // The PTT key is the only key we act on for *release* (press→start, up→stop).
     if let KeyCode::Char(c) = code
         && c == ptt_key
     {
-        return match kind {
-            KeyEventKind::Release => vec![UiEvent::PttStop],
-            _ => vec![UiEvent::PttStart],
+        if hold_ptt {
+            // Hold-to-talk: press → start, release → stop. Auto-repeat (a held
+            // key) is ignored so it does not thrash the capture pump.
+            return match kind {
+                KeyEventKind::Release => vec![UiEvent::PttStop],
+                KeyEventKind::Press => vec![UiEvent::PttStart],
+                KeyEventKind::Repeat => Vec::new(),
+            };
+        }
+        // No key-release available (legacy terminals): tap-to-toggle. Only a
+        // real press flips state; release never arrives and auto-repeat (also
+        // reported as Press on legacy terminals) would thrash — but a deliberate
+        // tap is the documented gesture here.
+        if kind != KeyEventKind::Press {
+            return Vec::new();
+        }
+        state.talking = !state.talking;
+        return if state.talking {
+            vec![UiEvent::PttStart]
+        } else {
+            vec![UiEvent::PttStop]
         };
     }
 
@@ -143,7 +175,7 @@ fn map_key_normal(
         // Enter compose mode; the PTT key itself can't double as compose.
         KeyCode::Char('t') | KeyCode::Char('T') if ptt_key != 't' && ptt_key != 'T' => {
             state.compose = Some(String::new());
-            Vec::new()
+            vec![UiEvent::Compose(Some(String::new()))]
         }
         KeyCode::Char('q') => vec![UiEvent::Hangup],
         _ => Vec::new(),
@@ -162,23 +194,25 @@ fn map_key_compose(state: &mut InputState, code: KeyCode, kind: KeyEventKind) ->
     match code {
         KeyCode::Char(c) => {
             buf.push(c);
-            Vec::new()
+            vec![UiEvent::Compose(Some(buf.clone()))]
         }
         KeyCode::Backspace => {
             buf.pop();
-            Vec::new()
+            vec![UiEvent::Compose(Some(buf.clone()))]
         }
         KeyCode::Enter => {
             let text = state.compose.take().unwrap_or_default();
             if text.is_empty() {
-                Vec::new()
+                // Empty line: just leave compose mode (no message sent).
+                vec![UiEvent::Compose(None)]
             } else {
+                // SendText implies compose has ended; the app clears the line.
                 vec![UiEvent::SendText(text)]
             }
         }
         KeyCode::Esc => {
             state.compose = None;
-            Vec::new()
+            vec![UiEvent::Compose(None)]
         }
         _ => Vec::new(),
     }
@@ -215,6 +249,9 @@ pub struct CallScreen {
     pub composing: bool,
     /// The in-progress compose buffer (shown after the prompt).
     pub compose_buffer: String,
+    /// Whether PTT is hold-to-talk (`true`, terminal reports key-release) or
+    /// tap-to-toggle (`false`). Drives the footer hint so the gesture matches.
+    pub ptt_hold: bool,
     /// Recent messages in the call (one per line, newest last). Truncated to fit screen.
     pub messages: Vec<String>,
 }
@@ -234,6 +271,7 @@ impl Default for CallScreen {
             bytes_recv: 0,
             composing: false,
             compose_buffer: String::new(),
+            ptt_hold: true,
             messages: Vec::new(),
         }
     }
@@ -310,6 +348,10 @@ impl UiHandle {
 pub struct Tui {
     /// The configured PTT key.
     ptt_key: char,
+    /// `true` when the terminal supports the kitty keyboard protocol (key-release
+    /// reporting was pushed in [`Tui::enter`]). Enables hold-to-talk PTT and must
+    /// be popped on restore.
+    keyboard_enhanced: bool,
     /// `true` while raw mode + alt-screen are active (so `Drop` restores once).
     active: bool,
     /// Stop flag shared with the reader thread (also held by [`UiHandle`]).
@@ -330,12 +372,31 @@ impl Tui {
         let mut out = std::io::stdout();
         execute!(out, EnterAlternateScreen, EnableBracketedPaste, Hide)
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        // Request key-release/repeat reporting where the terminal speaks the
+        // kitty keyboard protocol (Ghostty, kitty, foot, WezTerm…). This is what
+        // makes hold-to-talk PTT possible. Terminals without it (Terminal.app,
+        // iTerm2) report only key-press, so we leave the flag off and the input
+        // loop falls back to tap-to-toggle PTT.
+        let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
+        if keyboard_enhanced {
+            let _ = execute!(
+                out,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            );
+        }
         Ok(Tui {
             ptt_key: cfg.ptt_key,
+            keyboard_enhanced,
             active: true,
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reader: None,
         })
+    }
+
+    /// Whether hold-to-talk PTT is available (the terminal reports key-release).
+    /// `false` means the input loop uses tap-to-toggle PTT instead.
+    pub fn keyboard_enhanced(&self) -> bool {
+        self.keyboard_enhanced
     }
 
     /// Start the background input loop and render task, returning a [`UiHandle`]
@@ -361,10 +422,11 @@ impl Tui {
         // its own OS thread and forwards mapped events over the async channel. It
         // polls with a short timeout so the stop flag is observed promptly.
         let ptt_key = self.ptt_key;
+        let hold_ptt = self.keyboard_enhanced;
         let stop = self.stop.clone();
         let reader_stop = stop.clone();
         let handle = std::thread::spawn(move || {
-            reader_loop(ptt_key, ev_tx, reader_stop);
+            reader_loop(ptt_key, hold_ptt, ev_tx, reader_stop);
         });
         self.reader = Some(handle);
 
@@ -387,6 +449,9 @@ impl Tui {
             self.active = false;
             self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
             let mut out = std::io::stdout();
+            if self.keyboard_enhanced {
+                let _ = execute!(out, PopKeyboardEnhancementFlags);
+            }
             let _ = execute!(out, Show, DisableBracketedPaste, LeaveAlternateScreen);
             let _ = disable_raw_mode();
         }
@@ -408,6 +473,7 @@ impl Drop for Tui {
 /// receiver is dropped.
 fn reader_loop(
     ptt_key: char,
+    hold_ptt: bool,
     tx: mpsc::Sender<UiEvent>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -427,7 +493,7 @@ fn reader_loop(
         else {
             continue;
         };
-        for ev in map_key(&mut state, ptt_key, code, modifiers, kind) {
+        for ev in map_key(&mut state, ptt_key, hold_ptt, code, modifiers, kind) {
             let hangup = ev == UiEvent::Hangup;
             // `blocking_send` cannot be used from here without a runtime guarantee;
             // `try_send` drops on a momentarily-full channel, which is acceptable
@@ -520,11 +586,14 @@ fn render_screen(s: &CallScreen) -> Result<()> {
         }
     }
 
-    // Footer: either the compose line or the key hints.
+    // Footer: either the compose line or the key hints. The PTT hint matches the
+    // active gesture so users on legacy terminals know to tap rather than hold.
     let footer = if s.composing {
         format!("msg> {}", s.compose_buffer)
-    } else {
+    } else if s.ptt_hold {
         "[hold PTT key = talk]   [t = text]   [q / Ctrl-C = hangup]".to_string()
+    } else {
+        "[tap PTT key = talk on/off]   [t = text]   [q / Ctrl-C = hangup]".to_string()
     };
     queue!(out, MoveTo(0, footer_row), crossterm::style::Print(footer))
         .map_err(|e| io(std::io::Error::other(e)))?;
@@ -554,6 +623,9 @@ fn install_panic_hook() {
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let mut out = std::io::stdout();
+            // Best-effort: pop keyboard enhancement (harmless if never pushed)
+            // before restoring the screen so a panic never wedges the terminal.
+            let _ = execute!(out, PopKeyboardEnhancementFlags);
             let _ = execute!(out, Show, DisableBracketedPaste, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             default(info);
@@ -574,60 +646,106 @@ mod tests {
         (KeyCode::Char(c), KeyModifiers::NONE, KeyEventKind::Release)
     }
 
+    // Most tests exercise hold-to-talk semantics (terminal reports key-release).
+    const HOLD: bool = true;
+    const TOGGLE: bool = false;
+
     fn feed(
         state: &mut InputState,
         ptt: char,
+        hold_ptt: bool,
         (code, m, kind): (KeyCode, KeyModifiers, KeyEventKind),
     ) -> Vec<UiEvent> {
-        map_key(state, ptt, code, m, kind)
+        map_key(state, ptt, hold_ptt, code, m, kind)
     }
 
     #[test]
     fn ptt_press_and_release_maps_to_start_stop() {
         let mut st = InputState::new();
-        assert_eq!(feed(&mut st, PTT, press(' ')), vec![UiEvent::PttStart]);
-        assert_eq!(feed(&mut st, PTT, release(' ')), vec![UiEvent::PttStop]);
+        assert_eq!(feed(&mut st, PTT, HOLD, press(' ')), vec![UiEvent::PttStart]);
+        assert_eq!(feed(&mut st, PTT, HOLD, release(' ')), vec![UiEvent::PttStop]);
+    }
+
+    #[test]
+    fn ptt_hold_ignores_auto_repeat() {
+        let mut st = InputState::new();
+        let repeat = (KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert_eq!(feed(&mut st, PTT, HOLD, press(' ')), vec![UiEvent::PttStart]);
+        // A held key auto-repeats; it must not re-trigger capture.
+        assert_eq!(feed(&mut st, PTT, HOLD, repeat), Vec::<UiEvent>::new());
+        assert_eq!(feed(&mut st, PTT, HOLD, release(' ')), vec![UiEvent::PttStop]);
+    }
+
+    #[test]
+    fn ptt_toggle_flips_on_each_press() {
+        // On terminals without key-release, each press toggles transmit.
+        let mut st = InputState::new();
+        assert_eq!(
+            feed(&mut st, PTT, TOGGLE, press(' ')),
+            vec![UiEvent::PttStart]
+        );
+        // No release is ever delivered; if one were, it is inert.
+        assert_eq!(feed(&mut st, PTT, TOGGLE, release(' ')), Vec::<UiEvent>::new());
+        assert_eq!(
+            feed(&mut st, PTT, TOGGLE, press(' ')),
+            vec![UiEvent::PttStop]
+        );
+        assert_eq!(
+            feed(&mut st, PTT, TOGGLE, press(' ')),
+            vec![UiEvent::PttStart]
+        );
     }
 
     #[test]
     fn custom_ptt_key_is_honored() {
         let mut st = InputState::new();
-        assert_eq!(feed(&mut st, 'x', press('x')), vec![UiEvent::PttStart]);
-        assert_eq!(feed(&mut st, 'x', release('x')), vec![UiEvent::PttStop]);
+        assert_eq!(feed(&mut st, 'x', HOLD, press('x')), vec![UiEvent::PttStart]);
+        assert_eq!(feed(&mut st, 'x', HOLD, release('x')), vec![UiEvent::PttStop]);
         // Space is inert when it is not the PTT key.
-        assert_eq!(feed(&mut st, 'x', press(' ')), Vec::<UiEvent>::new());
+        assert_eq!(feed(&mut st, 'x', HOLD, press(' ')), Vec::<UiEvent>::new());
     }
 
     #[test]
     fn q_and_ctrl_c_hang_up() {
         let mut st = InputState::new();
-        assert_eq!(feed(&mut st, PTT, press('q')), vec![UiEvent::Hangup]);
+        assert_eq!(feed(&mut st, PTT, HOLD, press('q')), vec![UiEvent::Hangup]);
         let ctrl_c = (
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
             KeyEventKind::Press,
         );
-        assert_eq!(feed(&mut st, PTT, ctrl_c), vec![UiEvent::Hangup]);
+        assert_eq!(feed(&mut st, PTT, HOLD, ctrl_c), vec![UiEvent::Hangup]);
     }
 
     #[test]
     fn release_of_non_ptt_key_is_ignored() {
         let mut st = InputState::new();
         // A 'q' *release* must not hang up (only press does).
-        assert_eq!(feed(&mut st, PTT, release('q')), Vec::<UiEvent>::new());
+        assert_eq!(feed(&mut st, PTT, HOLD, release('q')), Vec::<UiEvent>::new());
     }
 
     #[test]
     fn t_enters_compose_and_enter_sends() {
         let mut st = InputState::new();
-        assert_eq!(feed(&mut st, PTT, press('t')), Vec::<UiEvent>::new());
+        // Entering compose emits a Compose(Some("")) so the screen shows the line.
+        assert_eq!(
+            feed(&mut st, PTT, HOLD, press('t')),
+            vec![UiEvent::Compose(Some(String::new()))]
+        );
         assert!(st.composing());
+        // Each keystroke emits the live buffer so typing is visible.
+        let mut typed = String::new();
         for c in "hi there".chars() {
-            assert_eq!(feed(&mut st, PTT, press(c)), Vec::<UiEvent>::new());
+            typed.push(c);
+            assert_eq!(
+                feed(&mut st, PTT, HOLD, press(c)),
+                vec![UiEvent::Compose(Some(typed.clone()))]
+            );
         }
         let evs = feed(
             &mut st,
             PTT,
+            HOLD,
             (KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press),
         );
         assert_eq!(evs, vec![UiEvent::SendText("hi there".to_string())]);
@@ -637,56 +755,66 @@ mod tests {
     #[test]
     fn space_types_into_message_while_composing() {
         let mut st = InputState::new();
-        feed(&mut st, PTT, press('t'));
+        feed(&mut st, PTT, HOLD, press('t'));
         // Space must NOT toggle PTT in compose mode; it appends to the buffer.
-        assert_eq!(feed(&mut st, PTT, press(' ')), Vec::<UiEvent>::new());
+        assert_eq!(
+            feed(&mut st, PTT, HOLD, press(' ')),
+            vec![UiEvent::Compose(Some(" ".to_string()))]
+        );
         assert_eq!(st.compose_buffer(), Some(" "));
     }
 
     #[test]
     fn backspace_and_esc_in_compose() {
         let mut st = InputState::new();
-        feed(&mut st, PTT, press('t'));
-        feed(&mut st, PTT, press('a'));
-        feed(&mut st, PTT, press('b'));
-        feed(
-            &mut st,
-            PTT,
-            (KeyCode::Backspace, KeyModifiers::NONE, KeyEventKind::Press),
+        feed(&mut st, PTT, HOLD, press('t'));
+        feed(&mut st, PTT, HOLD, press('a'));
+        feed(&mut st, PTT, HOLD, press('b'));
+        assert_eq!(
+            feed(
+                &mut st,
+                PTT,
+                HOLD,
+                (KeyCode::Backspace, KeyModifiers::NONE, KeyEventKind::Press),
+            ),
+            vec![UiEvent::Compose(Some("a".to_string()))]
         );
         assert_eq!(st.compose_buffer(), Some("a"));
         let evs = feed(
             &mut st,
             PTT,
+            HOLD,
             (KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Press),
         );
-        assert_eq!(evs, Vec::<UiEvent>::new());
+        assert_eq!(evs, vec![UiEvent::Compose(None)]);
         assert!(!st.composing(), "Esc cancels compose without sending");
     }
 
     #[test]
     fn empty_message_is_not_sent() {
         let mut st = InputState::new();
-        feed(&mut st, PTT, press('t'));
+        feed(&mut st, PTT, HOLD, press('t'));
         let evs = feed(
             &mut st,
             PTT,
+            HOLD,
             (KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press),
         );
-        assert_eq!(evs, Vec::<UiEvent>::new(), "empty line yields no SendText");
+        // Empty line just leaves compose mode; no SendText.
+        assert_eq!(evs, vec![UiEvent::Compose(None)]);
         assert!(!st.composing());
     }
 
     #[test]
     fn ctrl_c_hangs_up_even_while_composing() {
         let mut st = InputState::new();
-        feed(&mut st, PTT, press('t'));
+        feed(&mut st, PTT, HOLD, press('t'));
         let ctrl_c = (
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
             KeyEventKind::Press,
         );
-        assert_eq!(feed(&mut st, PTT, ctrl_c), vec![UiEvent::Hangup]);
+        assert_eq!(feed(&mut st, PTT, HOLD, ctrl_c), vec![UiEvent::Hangup]);
     }
 
     #[test]
