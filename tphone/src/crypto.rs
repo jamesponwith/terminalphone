@@ -248,13 +248,7 @@ impl CallKeys {
     /// The full AAD is `aad_bound || dir.tag() || seq.to_be_bytes()`, so the
     /// direction and sequence are authenticated even if a caller passes an empty
     /// `aad_bound`. The nonce is `dir.tag() || seq` (12 bytes).
-    pub fn seal(
-        &self,
-        dir: Direction,
-        seq: Seq,
-        aad_bound: &[u8],
-        plaintext: &[u8],
-    ) -> Vec<u8> {
+    pub fn seal(&self, dir: Direction, seq: Seq, aad_bound: &[u8], plaintext: &[u8]) -> Vec<u8> {
         let nonce = make_nonce(dir, seq);
         let aad = make_aad(aad_bound, dir, seq);
         // Encryption never fails for valid key/nonce sizes (which are fixed by
@@ -396,12 +390,16 @@ fn aead_encrypt(
         AeadSuite::Aes256Gcm => {
             use aes_gcm::{Aes256Gcm, Key, Nonce};
             let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-            cipher.encrypt(Nonce::from_slice(nonce), payload).map_err(|_| ())
+            cipher
+                .encrypt(Nonce::from_slice(nonce), payload)
+                .map_err(|_| ())
         }
         AeadSuite::ChaCha20Poly1305 => {
             use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
             let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-            cipher.encrypt(Nonce::from_slice(nonce), payload).map_err(|_| ())
+            cipher
+                .encrypt(Nonce::from_slice(nonce), payload)
+                .map_err(|_| ())
         }
     }
 }
@@ -425,12 +423,16 @@ fn aead_decrypt(
         AeadSuite::Aes256Gcm => {
             use aes_gcm::{Aes256Gcm, Key, Nonce};
             let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-            cipher.decrypt(Nonce::from_slice(nonce), payload).map_err(|_| ())
+            cipher
+                .decrypt(Nonce::from_slice(nonce), payload)
+                .map_err(|_| ())
         }
         AeadSuite::ChaCha20Poly1305 => {
             use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
             let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-            cipher.decrypt(Nonce::from_slice(nonce), payload).map_err(|_| ())
+            cipher
+                .decrypt(Nonce::from_slice(nonce), payload)
+                .map_err(|_| ())
         }
     }
 }
@@ -511,7 +513,10 @@ mod tests {
         let send = derive_call_keys(&psk(), &CALLER_NONCE, &CALLEE_NONCE, suite);
         let recv = derive_call_keys(&psk(), &CALLER_NONCE, &CALLEE_NONCE, suite);
         let ct = send.seal(Direction::CalleeToCaller, 0, b"", b"");
-        assert_eq!(recv.open(Direction::CalleeToCaller, 0, b"", &ct).unwrap(), b"");
+        assert_eq!(
+            recv.open(Direction::CalleeToCaller, 0, b"", &ct).unwrap(),
+            b""
+        );
     }
 
     #[test]
@@ -566,10 +571,17 @@ mod tests {
         let send = derive_call_keys(&psk(), &CALLER_NONCE, &CALLEE_NONCE, suite);
         let recv = derive_call_keys(&psk(), &CALLER_NONCE, &CALLEE_NONCE, suite);
         let ct = send.seal(Direction::CallerToCallee, 0, b"\x02", b"payload");
-        assert!(recv.open(Direction::CallerToCallee, 0, b"\x03", &ct).is_err());
+        assert!(
+            recv.open(Direction::CallerToCallee, 0, b"\x03", &ct)
+                .is_err()
+        );
         // Correct AAD still works (fresh receiver to avoid replay state).
         let recv2 = derive_call_keys(&psk(), &CALLER_NONCE, &CALLEE_NONCE, suite);
-        assert!(recv2.open(Direction::CallerToCallee, 0, b"\x02", &ct).is_ok());
+        assert!(
+            recv2
+                .open(Direction::CallerToCallee, 0, b"\x02", &ct)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -650,18 +662,29 @@ mod tests {
         let recv = derive_call_keys(&psk(), &CALLER_NONCE, &CALLEE_NONCE, suite);
 
         let cts: Vec<_> = (0..5u64)
-            .map(|s| send.seal(Direction::CallerToCallee, s, b"", format!("f{s}").as_bytes()))
+            .map(|s| {
+                send.seal(
+                    Direction::CallerToCallee,
+                    s,
+                    b"",
+                    format!("f{s}").as_bytes(),
+                )
+            })
             .collect();
 
         // Deliver out of order: 4, 1, 3, 0, 2 — all fresh.
         for s in [4u64, 1, 3, 0, 2] {
             assert!(
-                recv.open(Direction::CallerToCallee, s, b"", &cts[s as usize]).is_ok(),
+                recv.open(Direction::CallerToCallee, s, b"", &cts[s as usize])
+                    .is_ok(),
                 "seq {s} should be accepted"
             );
         }
         // Any replay now fails.
-        assert!(recv.open(Direction::CallerToCallee, 2, b"", &cts[2]).is_err());
+        assert!(
+            recv.open(Direction::CallerToCallee, 2, b"", &cts[2])
+                .is_err()
+        );
     }
 
     #[test]
@@ -678,7 +701,10 @@ mod tests {
 
         // Forged frame at seq 10_000: bogus bytes, will fail the tag.
         let forged = vec![0u8; 64];
-        assert!(recv.open(Direction::CallerToCallee, 10_000, b"", &forged).is_err());
+        assert!(
+            recv.open(Direction::CallerToCallee, 10_000, b"", &forged)
+                .is_err()
+        );
 
         // Legitimate next frame still opens (window was NOT advanced to 10_000).
         let ct1 = send.seal(Direction::CallerToCallee, 1, b"", b"frame 1");
@@ -746,8 +772,7 @@ mod tests {
 
     #[test]
     fn next_seq_is_monotonic() {
-        let mut keys =
-            derive_call_keys(&psk(), &CALLER_NONCE, &CALLEE_NONCE, AeadSuite::Aes256Gcm);
+        let mut keys = derive_call_keys(&psk(), &CALLER_NONCE, &CALLEE_NONCE, AeadSuite::Aes256Gcm);
         for expected in 0..100u64 {
             assert_eq!(keys.next_seq(), expected);
         }
@@ -792,7 +817,11 @@ mod tests {
         assert_ne!(correct.key, swapped.key);
 
         let ct = correct.seal(Direction::CallerToCallee, 0, b"", b"x");
-        assert!(swapped.open(Direction::CallerToCallee, 0, b"", &ct).is_err());
+        assert!(
+            swapped
+                .open(Direction::CallerToCallee, 0, b"", &ct)
+                .is_err()
+        );
     }
 
     #[test]
@@ -801,7 +830,10 @@ mod tests {
         let call1 = derive_call_keys(&psk(), &CALLER_NONCE, &CALLEE_NONCE, suite);
         let other_nonce = CallNonce([0x33u8; 32]);
         let call2 = derive_call_keys(&psk(), &CALLER_NONCE, &other_nonce, suite);
-        assert_ne!(call1.key, call2.key, "different call nonces → different keys");
+        assert_ne!(
+            call1.key, call2.key,
+            "different call nonces → different keys"
+        );
     }
 
     // ---- PSK / nonce generation ------------------------------------------

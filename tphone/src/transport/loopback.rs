@@ -106,9 +106,7 @@ impl Transport for LoopbackTransport {
             .lock()
             .expect("loopback accept_rx mutex poisoned")
             .take()
-            .ok_or_else(|| {
-                Error::Transport("loopback transport already hosting".to_string())
-            })?;
+            .ok_or_else(|| Error::Transport("loopback transport already hosting".to_string()))?;
         Ok(Box::pin(AcceptStream { rx }))
     }
 
@@ -366,7 +364,10 @@ mod tests {
     async fn large_payload_roundtrips() {
         let transport = LoopbackTransport::new(OnionAddr("big.onion".to_string()));
         let mut incoming = transport.host(&test_identity()).await.unwrap();
-        let mut dialer = transport.dial(&OnionAddr("big.onion".to_string())).await.unwrap();
+        let mut dialer = transport
+            .dial(&OnionAddr("big.onion".to_string()))
+            .await
+            .unwrap();
         let mut host_conn = {
             use futures::StreamExt;
             incoming.next().await.unwrap().unwrap()

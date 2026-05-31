@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::app::{run_call, run_handshake, CallIo, Role};
+use crate::app::{CallIo, Role, run_call, run_handshake};
 use crate::audio::codec::{OpusDecoder, OpusEncoder};
 use crate::audio::{AudioConfig, AudioEngine, OpusFrame, PcmFrame, SyntheticBackend};
 use crate::config::OpusParams;
@@ -153,7 +153,7 @@ pub async fn run() -> Result<()> {
             Err(_) => {
                 return Err(Error::Audio(
                     "selftest: timed out waiting for inbound audio".into(),
-                ))
+                ));
             }
         }
     }
@@ -162,10 +162,7 @@ pub async fn run() -> Result<()> {
     wait_for_samples(&played, reference.len(), Duration::from_secs(5)).await?;
 
     // --- Wait for the callee to receive the text message. ---
-    let mut callee_msg_in_rx = callee_handles
-        .msg_in_rx
-        .take()
-        .expect("msg_in_rx present");
+    let mut callee_msg_in_rx = callee_handles.msg_in_rx.take().expect("msg_in_rx present");
     let got_msg = tokio::time::timeout(Duration::from_secs(5), callee_msg_in_rx.recv())
         .await
         .map_err(|_| Error::Audio("selftest: timed out waiting for message".into()))?
@@ -300,7 +297,11 @@ fn reference_pcm(opus: OpusParams) -> Result<Vec<i16>> {
 }
 
 /// Poll the playback buffer until it holds at least `n` samples or `timeout`.
-async fn wait_for_samples(played: &Arc<Mutex<Vec<i16>>>, n: usize, timeout: Duration) -> Result<()> {
+async fn wait_for_samples(
+    played: &Arc<Mutex<Vec<i16>>>,
+    n: usize,
+    timeout: Duration,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if played.lock().expect("played lock").len() >= n {

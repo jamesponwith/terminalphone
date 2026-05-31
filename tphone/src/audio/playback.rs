@@ -269,7 +269,10 @@ mod tests {
     #[test]
     fn duration_to_samples_matches_rate() {
         // 250 ms @ 16 kHz = 4000 samples.
-        assert_eq!(duration_to_samples(Duration::from_millis(250), 16_000), 4000);
+        assert_eq!(
+            duration_to_samples(Duration::from_millis(250), 16_000),
+            4000
+        );
         // 20 ms @ 48 kHz = 960 samples.
         assert_eq!(duration_to_samples(Duration::from_millis(20), 48_000), 960);
         assert_eq!(duration_to_samples(Duration::from_millis(0), 16_000), 0);

@@ -395,10 +395,15 @@ pub async fn run_call(
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<ControlOut>(8);
 
     let recv_keys = keys.clone();
-    let recv_fut = recv_loop(reader, recv_keys, recv_dir, audio_in, msg_in, ctrl_tx.clone());
-    let send_fut = send_loop(
-        writer, keys, send_dir, audio_out, msg_out, hangup, ctrl_rx,
+    let recv_fut = recv_loop(
+        reader,
+        recv_keys,
+        recv_dir,
+        audio_in,
+        msg_in,
+        ctrl_tx.clone(),
     );
+    let send_fut = send_loop(writer, keys, send_dir, audio_out, msg_out, hangup, ctrl_rx);
 
     // Whichever half finishes first decides the call outcome; the other is
     // dropped (its half of the stream closes, unblocking the peer).

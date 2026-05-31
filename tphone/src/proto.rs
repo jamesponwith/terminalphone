@@ -401,12 +401,7 @@ where
     let peer_hello = read_hello(stream).await?;
 
     let peer = negotiate(&my_hello, &peer_hello)?;
-    let keys = crate::crypto::derive_call_keys(
-        psk,
-        &my_hello.nonce,
-        &peer_hello.nonce,
-        peer.suite,
-    );
+    let keys = crate::crypto::derive_call_keys(psk, &my_hello.nonce, &peer_hello.nonce, peer.suite);
     // Direction tag is intrinsic to seal/open call sites; the proto layer simply
     // reports which role this side plays via the keys it derived.
     let _ = Direction::CallerToCallee;
@@ -433,12 +428,7 @@ where
     // both sides MUST present the canonical caller-then-callee order to derive
     // an identical key. On the callee, the *caller's* nonce is the peer's, so we
     // pass `(peer_hello.nonce, my_hello.nonce)` = `(caller_nonce, callee_nonce)`.
-    let keys = crate::crypto::derive_call_keys(
-        psk,
-        &peer_hello.nonce,
-        &my_hello.nonce,
-        peer.suite,
-    );
+    let keys = crate::crypto::derive_call_keys(psk, &peer_hello.nonce, &my_hello.nonce, peer.suite);
     let _ = Direction::CalleeToCaller;
     Ok((keys, peer))
 }
@@ -521,9 +511,9 @@ mod tests {
     // unbounded channel and writes to the other; bytes are framed as Vec<u8>
     // chunks and re-buffered on the read side so partial reads behave like a
     // real stream.
-    use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
-    use futures::task::{Context, Poll};
     use futures::Stream; // brings `poll_next` into scope for the duplex read impl
+    use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+    use futures::task::{Context, Poll};
     use std::pin::Pin;
 
     struct DuplexEnd {
@@ -600,17 +590,11 @@ mod tests {
             }
         }
 
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             self.tx.close_channel();
             Poll::Ready(Ok(()))
         }
@@ -779,12 +763,18 @@ mod tests {
             let psk = Psk::from_bytes([0x42u8; 32]);
 
             let caller_hello = {
-                let mut h = sample_hello("calleronion000000000000000000000000000000id.onion", AeadSuite::Aes256Gcm);
+                let mut h = sample_hello(
+                    "calleronion000000000000000000000000000000id.onion",
+                    AeadSuite::Aes256Gcm,
+                );
                 h.nonce = CallNonce([0x11u8; 32]);
                 h
             };
             let callee_hello = {
-                let mut h = sample_hello("calleeonion000000000000000000000000000000id.onion", AeadSuite::Aes256Gcm);
+                let mut h = sample_hello(
+                    "calleeonion000000000000000000000000000000id.onion",
+                    AeadSuite::Aes256Gcm,
+                );
                 h.nonce = CallNonce([0x22u8; 32]);
                 h
             };
@@ -824,8 +814,7 @@ mod tests {
             assert_eq!(opened, pt);
 
             // And the reverse direction.
-            let sealed_back =
-                callee_keys.seal(Direction::CalleeToCaller, 0, aad, pt);
+            let sealed_back = callee_keys.seal(Direction::CalleeToCaller, 0, aad, pt);
             let opened_back = caller_keys
                 .open(Direction::CalleeToCaller, 0, aad, &sealed_back)
                 .expect("caller opens callee-sealed frame -> keys match");
@@ -838,10 +827,8 @@ mod tests {
         futures::executor::block_on(async {
             let psk = Psk::from_bytes([0x42u8; 32]);
 
-            let caller_hello =
-                sample_hello("calleronion.onion", AeadSuite::Aes256Gcm);
-            let callee_hello =
-                sample_hello("calleeonion.onion", AeadSuite::ChaCha20Poly1305);
+            let caller_hello = sample_hello("calleronion.onion", AeadSuite::Aes256Gcm);
+            let callee_hello = sample_hello("calleeonion.onion", AeadSuite::ChaCha20Poly1305);
 
             let (mut caller_stream, mut callee_stream) = duplex();
 

@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use tphone::app::{run_call, run_handshake, CallIo, Role};
+use tphone::app::{CallIo, Role, run_call, run_handshake};
 use tphone::audio::OpusFrame;
 use tphone::config::OpusParams;
 use tphone::crypto::{AeadSuite, CallNonce, Psk};
@@ -85,9 +85,15 @@ fn make_endpoint() -> Endpoint {
 /// — it only seals/opens, so any payload proves the pipeline).
 fn synthetic_frames() -> Vec<OpusFrame> {
     vec![
-        OpusFrame { data: vec![0x01, 0x02, 0x03, 0x04] },
-        OpusFrame { data: vec![0xAA; 80] },
-        OpusFrame { data: (0..200u32).map(|i| (i % 251) as u8).collect() },
+        OpusFrame {
+            data: vec![0x01, 0x02, 0x03, 0x04],
+        },
+        OpusFrame {
+            data: vec![0xAA; 80],
+        },
+        OpusFrame {
+            data: (0..200u32).map(|i| (i % 251) as u8).collect(),
+        },
     ]
 }
 
@@ -100,8 +106,18 @@ async fn loopback_full_pipeline_round_trips_audio_and_msg() {
     let psk_a = psk.clone();
     let psk_b = psk.clone();
     let (caller_hs, callee_hs) = tokio::join!(
-        run_handshake(&mut caller_conn, &psk_a, hello("caller.onion", 0x11), Role::Caller),
-        run_handshake(&mut callee_conn, &psk_b, hello("callee.onion", 0x22), Role::Callee),
+        run_handshake(
+            &mut caller_conn,
+            &psk_a,
+            hello("caller.onion", 0x11),
+            Role::Caller
+        ),
+        run_handshake(
+            &mut callee_conn,
+            &psk_b,
+            hello("callee.onion", 0x22),
+            Role::Callee
+        ),
     );
     let (caller_keys, caller_peer) = caller_hs.expect("caller handshake");
     let (callee_keys, callee_peer) = callee_hs.expect("callee handshake");
@@ -139,7 +155,10 @@ async fn loopback_full_pipeline_round_trips_audio_and_msg() {
             .await
             .expect("audio frame not received in time")
             .expect("audio_in channel closed");
-        assert_eq!(got.data, expected.data, "audio frame must round-trip exactly");
+        assert_eq!(
+            got.data, expected.data,
+            "audio frame must round-trip exactly"
+        );
     }
 
     // Callee -> caller: a text message round-trips exactly.
@@ -181,8 +200,18 @@ async fn wrong_psk_peer_cannot_open_frames() {
     let callee_psk = Psk::from_bytes([0x99; 32]);
 
     let (caller_hs, callee_hs) = tokio::join!(
-        run_handshake(&mut caller_conn, &caller_psk, hello("caller.onion", 0x11), Role::Caller),
-        run_handshake(&mut callee_conn, &callee_psk, hello("callee.onion", 0x22), Role::Callee),
+        run_handshake(
+            &mut caller_conn,
+            &caller_psk,
+            hello("caller.onion", 0x11),
+            Role::Caller
+        ),
+        run_handshake(
+            &mut callee_conn,
+            &callee_psk,
+            hello("callee.onion", 0x22),
+            Role::Callee
+        ),
     );
     let (caller_keys, caller_peer) = caller_hs.expect("caller handshake");
     let (callee_keys, callee_peer) = callee_hs.expect("callee handshake");

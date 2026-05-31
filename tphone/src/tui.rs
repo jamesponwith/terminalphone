@@ -29,7 +29,7 @@ use crossterm::event::{
     KeyModifiers,
 };
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use crossterm::{execute, queue};
 use tokio::sync::mpsc;
@@ -461,7 +461,10 @@ fn render_screen(s: &CallScreen) -> Result<()> {
         "TerminalPhone — secure push-to-talk".to_string(),
         format!("you   : {}", s.local_onion),
         format!("peer  : {}", s.remote_onion),
-        format!("cipher: {} [{}]   hops: {}", s.suite_label, suite_ind, s.hop_mode),
+        format!(
+            "cipher: {} [{}]   hops: {}",
+            s.suite_label, suite_ind, s.hop_mode
+        ),
         format!(
             "stats : {} ms   tx {}   rx {}",
             s.latency_ms,
@@ -471,7 +474,11 @@ fn render_screen(s: &CallScreen) -> Result<()> {
         format!(
             "ptt   : local {}   remote {}",
             if s.local_ptt { "[REC]" } else { " --- " },
-            if s.remote_ptt { "[RECORDING]" } else { "  idle     " },
+            if s.remote_ptt {
+                "[RECORDING]"
+            } else {
+                "  idle     "
+            },
         ),
         "─".repeat(60),
     ];
@@ -487,12 +494,8 @@ fn render_screen(s: &CallScreen) -> Result<()> {
     } else {
         "[hold PTT key = talk]   [t = text]   [q / Ctrl-C = hangup]".to_string()
     };
-    queue!(
-        out,
-        MoveTo(0, footer_row),
-        crossterm::style::Print(footer)
-    )
-    .map_err(|e| io(std::io::Error::other(e)))?;
+    queue!(out, MoveTo(0, footer_row), crossterm::style::Print(footer))
+        .map_err(|e| io(std::io::Error::other(e)))?;
 
     out.flush().map_err(Error::Io)?;
     Ok(())

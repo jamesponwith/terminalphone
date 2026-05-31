@@ -157,7 +157,7 @@ impl AudioBackend for CpalBackend {
             Err(_) => {
                 return Err(Error::Audio(
                     "capture thread exited before signalling readiness".into(),
-                ))
+                ));
             }
         }
 
@@ -182,7 +182,7 @@ impl AudioBackend for CpalBackend {
             Err(_) => {
                 return Err(Error::Audio(
                     "playback thread exited before signalling readiness".into(),
-                ))
+                ));
             }
         }
 
@@ -678,14 +678,20 @@ mod tests {
         let mut source = backend.open_capture(cfg()).unwrap();
 
         // Gate closed by default: nothing.
-        assert!(source.next_frame().is_none(), "no frames before PTT engaged");
+        assert!(
+            source.next_frame().is_none(),
+            "no frames before PTT engaged"
+        );
 
         source.set_ptt(true);
         let frame = source.next_frame().expect("a frame while PTT held");
         assert!(!frame.data.is_empty(), "encoded opus frame is non-empty");
 
         source.set_ptt(false);
-        assert!(source.next_frame().is_none(), "no frames after PTT released");
+        assert!(
+            source.next_frame().is_none(),
+            "no frames after PTT released"
+        );
     }
 
     /// The engine capture pump only emits frames while PTT is engaged, and stops

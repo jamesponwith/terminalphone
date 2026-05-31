@@ -19,8 +19,8 @@
 //! time so a bad config fails loudly rather than producing garbage frames.
 
 use audiopus::{
-    coder::{Decoder as RawDecoder, Encoder as RawEncoder},
     Application, Bitrate, Channels, SampleRate,
+    coder::{Decoder as RawDecoder, Encoder as RawEncoder},
 };
 
 use crate::audio::{OpusFrame, PcmFrame};

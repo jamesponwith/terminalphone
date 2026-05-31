@@ -12,9 +12,9 @@
 //! pure resample/frame logic is exercised by unit tests with a synthetic
 //! producer, so the crate builds and the logic is testable without a mic.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::sync::Arc;
 
 use crate::audio::{AudioConfig, PcmFrame};
 use crate::error::{Error, Result};
@@ -75,10 +75,8 @@ impl Capture {
         let gate = Arc::new(AtomicBool::new(false));
         let (raw_tx, raw_rx) = std::sync::mpsc::channel::<f32>();
 
-        let (device_stream, device_rate) =
-            open_input_stream(gate.clone(), raw_tx).map_err(|e| {
-                Error::Audio(format!("failed to open input device: {e}"))
-            })?;
+        let (device_stream, device_rate) = open_input_stream(gate.clone(), raw_tx)
+            .map_err(|e| Error::Audio(format!("failed to open input device: {e}")))?;
 
         let inner = CaptureInner {
             gate,
