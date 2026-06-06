@@ -34,6 +34,7 @@ chacha20poly1305 = "0.10"
 aead = "0.5"
 hkdf = "0.12"
 sha2 = "0.10"
+argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.8"
 
@@ -45,6 +46,11 @@ toml = "0.8"
 cpal = "0.15"
 audiopus = "0.2"
 crossterm = "0.28"
+
+# identity sharing: render .onion as a scannable terminal QR. default-features
+# off drops the `image`/`svg` renderers (and their deps) — we render to unicode
+# half-blocks ourselves from `to_colors()`.
+qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time", "test-util"] }

@@ -36,7 +36,10 @@ const TEST_PSK: [u8; 32] = [0x42; 32];
 /// Run the headless integrated self-test. Returns `Ok(())` on an exact match.
 pub async fn run() -> Result<()> {
     let opus = OpusParams::default();
-    let audio_cfg = AudioConfig { opus };
+    let audio_cfg = AudioConfig {
+        opus,
+        voice_effect: crate::audio::voice::VoiceEffect::default(),
+    };
 
     // --- Transport pair over loopback (no Tor). ---
     let (mut caller_conn, mut callee_conn) = connected_pair().await?;
@@ -247,15 +250,20 @@ struct IoHandles {
 fn make_io() -> (CallIo, IoHandles) {
     let (audio_out_tx, audio_out) = mpsc::channel::<OpusFrame>(64);
     let (msg_out_tx, msg_out) = mpsc::channel::<String>(8);
+    let (_ptt_out_tx, ptt_out) = mpsc::channel::<bool>(8);
     let (audio_in, audio_in_rx) = mpsc::channel::<OpusFrame>(64);
     let (msg_in, msg_in_rx) = mpsc::channel::<String>(8);
+    let (events_in, _events_in_rx) = mpsc::channel::<crate::app::CallEvent>(16);
     let (hangup_tx, hangup) = mpsc::channel::<()>(1);
     (
         CallIo {
             audio_out,
             msg_out,
+            ptt_out,
             audio_in,
             msg_in,
+            events_in,
+            stats: std::sync::Arc::new(crate::app::CallStats::default()),
             hangup,
         },
         IoHandles {

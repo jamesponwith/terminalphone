@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::audio::voice::VoiceEffect;
 use crate::crypto::AeadSuite;
 use crate::error::Result;
 use crate::transport::TorConfig;
@@ -65,6 +66,8 @@ struct ConfigToml {
     jitter_lead_ms: Option<u64>,
     #[serde(default)]
     app_port: Option<u16>,
+    #[serde(default)]
+    voice_effect: Option<VoiceEffect>,
 }
 
 /// Top-level user config persisted as `config.toml` (SPEC §6.2).
@@ -82,6 +85,8 @@ pub struct Config {
     pub jitter_lead: Duration,
     /// Application port carried inside the onion circuit (matches v1 LISTEN_PORT).
     pub app_port: u16,
+    /// Outgoing-voice changer effect applied before Opus encode (tp-5xj).
+    pub voice_effect: VoiceEffect,
     /// Root data directory ($DATA_DIR); all other paths derive from it.
     pub data_dir: PathBuf,
 }
@@ -95,6 +100,7 @@ impl Default for Config {
             speed_mode: SpeedMode::default(),
             jitter_lead: Duration::from_millis(250),
             app_port: 7777,
+            voice_effect: VoiceEffect::default(),
             data_dir: default_data_dir(),
         }
     }
@@ -136,6 +142,9 @@ impl Config {
             if let Some(opus) = parsed.opus {
                 cfg.opus = opus;
             }
+            if let Some(effect) = parsed.voice_effect {
+                cfg.voice_effect = effect;
+            }
         }
 
         Ok(cfg)
@@ -159,6 +168,7 @@ impl Config {
             speed_mode: Some(self.speed_mode),
             jitter_lead_ms: Some(self.jitter_lead.as_millis() as u64),
             opus: Some(self.opus),
+            voice_effect: Some(self.voice_effect),
         };
 
         let body = toml::to_string_pretty(&toml_data)?;
@@ -228,6 +238,7 @@ mod tests {
             app_port: 8888,
             speed_mode: SpeedMode::FullAnonymity,
             jitter_lead: Duration::from_millis(500),
+            voice_effect: VoiceEffect::Robot,
             opus: OpusParams {
                 sample_rate: 8_000,
                 channels: 1,
@@ -244,6 +255,7 @@ mod tests {
         assert_eq!(orig.app_port, loaded.app_port);
         assert_eq!(orig.speed_mode, loaded.speed_mode);
         assert_eq!(orig.jitter_lead, loaded.jitter_lead);
+        assert_eq!(orig.voice_effect, loaded.voice_effect);
         assert_eq!(orig.opus.sample_rate, loaded.opus.sample_rate);
         assert_eq!(orig.opus.channels, loaded.opus.channels);
         assert_eq!(orig.opus.bitrate, loaded.opus.bitrate);

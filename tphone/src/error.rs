@@ -42,6 +42,10 @@ pub enum Error {
     #[error("config error: {0}")]
     Config(String),
 
+    /// QR-code encoding failures (input too large for any version, etc.).
+    #[error("qr error: {0}")]
+    Qr(String),
+
     /// Underlying byte I/O on the onion `Conn` or on local files.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

@@ -50,6 +50,21 @@ pub enum FrameType {
 }
 
 impl FrameType {
+    /// Short upper-case name for diagnostics (e.g. truncation errors).
+    fn label(self) -> &'static str {
+        match self {
+            FrameType::Hello => "HELLO",
+            FrameType::Audio => "AUDIO",
+            FrameType::Msg => "MSG",
+            FrameType::PttStart => "PTT_START",
+            FrameType::PttStop => "PTT_STOP",
+            FrameType::Ping => "PING",
+            FrameType::Pong => "PONG",
+            FrameType::Hangup => "HANGUP",
+            FrameType::Cipher => "CIPHER",
+        }
+    }
+
     /// Parse a type byte; `None` for unknown types.
     pub fn from_u8(b: u8) -> Option<Self> {
         Some(match b {
@@ -155,13 +170,16 @@ impl Hello {
     }
 }
 
-/// A decoded protocol frame. Sealed variants carry ciphertext; the handshake
-/// frame is plaintext.
+/// A decoded protocol frame. Every variant except the plaintext `Hello`
+/// handshake carries an 8-byte per-direction `seq` ahead of its AEAD ciphertext,
+/// so *all* post-handshake frames — including control frames like `Hangup` —
+/// are authenticated and replay-checked (SPEC §5.3: nothing but `HELLO` is
+/// unsealed, and no post-handshake frame can be injected without the PSK).
 #[derive(Debug, Clone)]
 pub enum Frame {
     /// Unsealed handshake.
     Hello(Hello),
-    /// Sealed Opus audio with its per-direction sequence.
+    /// Sealed Opus audio.
     Audio {
         /// Monotonic frame sequence (also bound into AAD).
         seq: Seq,
@@ -170,36 +188,50 @@ pub enum Frame {
     },
     /// Sealed UTF-8 text message.
     Msg {
-        /// Sealed text bytes.
+        /// Monotonic frame sequence (also bound into AAD).
+        seq: Seq,
+        /// AEAD-sealed text bytes.
         sealed: Vec<u8>,
     },
     /// Sealed PTT-start control.
     PttStart {
-        /// Sealed control payload.
+        /// Monotonic frame sequence (also bound into AAD).
+        seq: Seq,
+        /// Sealed (empty) control payload.
         sealed: Vec<u8>,
     },
     /// Sealed PTT-stop control.
     PttStop {
-        /// Sealed control payload.
+        /// Monotonic frame sequence (also bound into AAD).
+        seq: Seq,
+        /// Sealed (empty) control payload.
         sealed: Vec<u8>,
     },
     /// Sealed keepalive ping.
     Ping {
-        /// Sealed control payload.
+        /// Monotonic frame sequence (also bound into AAD).
+        seq: Seq,
+        /// Sealed (empty) control payload.
         sealed: Vec<u8>,
     },
     /// Sealed keepalive pong.
     Pong {
-        /// Sealed control payload.
+        /// Monotonic frame sequence (also bound into AAD).
+        seq: Seq,
+        /// Sealed (empty) control payload.
         sealed: Vec<u8>,
     },
     /// Sealed graceful hangup.
     Hangup {
-        /// Sealed control payload.
+        /// Monotonic frame sequence (also bound into AAD).
+        seq: Seq,
+        /// Sealed (empty) control payload.
         sealed: Vec<u8>,
     },
     /// Sealed mid-call AEAD re-negotiation request.
     Cipher {
+        /// Monotonic frame sequence (also bound into AAD).
+        seq: Seq,
         /// Sealed payload carrying the new suite id.
         sealed: Vec<u8>,
     },
@@ -221,54 +253,85 @@ impl Frame {
         }
     }
 
+    /// Total bytes this frame occupies on the wire: the 6-byte `ver|type|len`
+    /// header plus the payload. Used for call byte-stats without re-reading the
+    /// stream. Matches exactly what [`write_frame`] emits.
+    pub fn wire_len(&self) -> usize {
+        const HEADER: usize = 6;
+        let payload = match self {
+            Frame::Hello(h) => h.encode().len(),
+            // Every sealed frame is `8-byte seq || sealed`.
+            Frame::Audio { sealed, .. }
+            | Frame::Msg { sealed, .. }
+            | Frame::PttStart { sealed, .. }
+            | Frame::PttStop { sealed, .. }
+            | Frame::Ping { sealed, .. }
+            | Frame::Pong { sealed, .. }
+            | Frame::Hangup { sealed, .. }
+            | Frame::Cipher { sealed, .. } => 8 + sealed.len(),
+        };
+        HEADER + payload
+    }
+
     /// Serialize the frame *payload* (the bytes that follow the `ver|type|len`
-    /// header). For `Audio` the 8-byte big-endian sequence is prefixed ahead of
-    /// the sealed ciphertext; all other sealed variants are the raw ciphertext;
-    /// `Hello` is the encoded plaintext HELLO body.
+    /// header). Every sealed frame prefixes its 8-byte big-endian sequence ahead
+    /// of the ciphertext; `Hello` is the encoded plaintext HELLO body.
     fn encode_payload(&self) -> Vec<u8> {
         match self {
             Frame::Hello(h) => h.encode(),
-            Frame::Audio { seq, sealed } => {
-                let mut buf = Vec::with_capacity(8 + sealed.len());
-                buf.extend_from_slice(&seq.to_be_bytes());
-                buf.extend_from_slice(sealed);
-                buf
-            }
-            Frame::Msg { sealed }
-            | Frame::PttStart { sealed }
-            | Frame::PttStop { sealed }
-            | Frame::Ping { sealed }
-            | Frame::Pong { sealed }
-            | Frame::Hangup { sealed }
-            | Frame::Cipher { sealed } => sealed.clone(),
+            Frame::Audio { seq, sealed }
+            | Frame::Msg { seq, sealed }
+            | Frame::PttStart { seq, sealed }
+            | Frame::PttStop { seq, sealed }
+            | Frame::Ping { seq, sealed }
+            | Frame::Pong { seq, sealed }
+            | Frame::Hangup { seq, sealed }
+            | Frame::Cipher { seq, sealed } => encode_seq_payload(*seq, sealed),
         }
     }
 
     /// Reconstruct a frame from its type byte and payload bytes.
     fn decode_payload(ty: FrameType, payload: Vec<u8>) -> Result<Self> {
+        if let FrameType::Hello = ty {
+            return Ok(Frame::Hello(Hello::decode(&payload)?));
+        }
+        // All other frames are `8-byte seq || sealed`.
+        let (seq, sealed) = decode_seq_payload(&payload, ty.label())?;
         Ok(match ty {
-            FrameType::Hello => Frame::Hello(Hello::decode(&payload)?),
-            FrameType::Audio => {
-                if payload.len() < 8 {
-                    return Err(Error::Proto(
-                        "AUDIO frame too short to hold an 8-byte sequence".into(),
-                    ));
-                }
-                let mut seq_bytes = [0u8; 8];
-                seq_bytes.copy_from_slice(&payload[..8]);
-                let seq = u64::from_be_bytes(seq_bytes);
-                let sealed = payload[8..].to_vec();
-                Frame::Audio { seq, sealed }
-            }
-            FrameType::Msg => Frame::Msg { sealed: payload },
-            FrameType::PttStart => Frame::PttStart { sealed: payload },
-            FrameType::PttStop => Frame::PttStop { sealed: payload },
-            FrameType::Ping => Frame::Ping { sealed: payload },
-            FrameType::Pong => Frame::Pong { sealed: payload },
-            FrameType::Hangup => Frame::Hangup { sealed: payload },
-            FrameType::Cipher => Frame::Cipher { sealed: payload },
+            FrameType::Hello => unreachable!("handled above"),
+            FrameType::Audio => Frame::Audio { seq, sealed },
+            FrameType::Msg => Frame::Msg { seq, sealed },
+            FrameType::PttStart => Frame::PttStart { seq, sealed },
+            FrameType::PttStop => Frame::PttStop { seq, sealed },
+            FrameType::Ping => Frame::Ping { seq, sealed },
+            FrameType::Pong => Frame::Pong { seq, sealed },
+            FrameType::Hangup => Frame::Hangup { seq, sealed },
+            FrameType::Cipher => Frame::Cipher { seq, sealed },
         })
     }
+}
+
+/// Encode a sealed payload that carries an 8-byte big-endian sequence prefix
+/// (every sealed frame; they share one per-direction replay sequence).
+fn encode_seq_payload(seq: Seq, sealed: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + sealed.len());
+    buf.extend_from_slice(&seq.to_be_bytes());
+    buf.extend_from_slice(sealed);
+    buf
+}
+
+/// Split the 8-byte big-endian sequence prefix off a sealed frame payload.
+/// `what` names the frame type for the truncation error message.
+fn decode_seq_payload(payload: &[u8], what: &str) -> Result<(Seq, Vec<u8>)> {
+    if payload.len() < 8 {
+        return Err(Error::Proto(format!(
+            "{what} frame too short to hold an 8-byte sequence"
+        )));
+    }
+    let mut seq_bytes = [0u8; 8];
+    seq_bytes.copy_from_slice(&payload[..8]);
+    let seq = Seq::from_be_bytes(seq_bytes);
+    Ok((seq, payload[8..].to_vec()))
 }
 
 /// Write one frame to `w` in the `ver|type|len|payload` format.
@@ -630,25 +693,50 @@ mod tests {
                 sealed: Vec::new(),
             },
             Frame::Msg {
+                seq: 0x0000_0000_0000_0007,
                 sealed: sealed.clone(),
             },
+            Frame::Msg {
+                seq: 0,
+                sealed: Vec::new(),
+            },
             Frame::PttStart {
+                seq: 11,
                 sealed: sealed.clone(),
             },
             Frame::PttStop {
+                seq: 12,
                 sealed: sealed.clone(),
             },
             Frame::Ping {
+                seq: 13,
                 sealed: sealed.clone(),
             },
             Frame::Pong {
+                seq: 14,
                 sealed: sealed.clone(),
             },
             Frame::Hangup {
+                seq: 15,
                 sealed: sealed.clone(),
             },
-            Frame::Cipher { sealed },
+            Frame::Cipher { seq: 16, sealed },
         ]
+    }
+
+    /// Extract `(seq, sealed)` from any sealed frame; `None` for `Hello`.
+    fn sealed_parts(f: &Frame) -> Option<(Seq, &[u8])> {
+        match f {
+            Frame::Hello(_) => None,
+            Frame::Audio { seq, sealed }
+            | Frame::Msg { seq, sealed }
+            | Frame::PttStart { seq, sealed }
+            | Frame::PttStop { seq, sealed }
+            | Frame::Ping { seq, sealed }
+            | Frame::Pong { seq, sealed }
+            | Frame::Hangup { seq, sealed }
+            | Frame::Cipher { seq, sealed } => Some((*seq, sealed)),
+        }
     }
 
     fn assert_frame_eq(a: &Frame, b: &Frame) {
@@ -660,29 +748,14 @@ mod tests {
                 assert_eq!(x.opus, y.opus);
                 assert_eq!(x.nonce, y.nonce);
             }
-            (
-                Frame::Audio {
-                    seq: sx,
-                    sealed: cx,
-                },
-                Frame::Audio {
-                    seq: sy,
-                    sealed: cy,
-                },
-            ) => {
-                assert_eq!(sx, sy);
-                assert_eq!(cx, cy);
+            // All sealed variants are `{ seq, sealed }`; compare both. The
+            // frame_type equality above already proved the variant matches.
+            _ => {
+                let (sx, cx) = sealed_parts(a).expect("sealed frame");
+                let (sy, cy) = sealed_parts(b).expect("sealed frame");
+                assert_eq!(sx, sy, "seq mismatch after round-trip");
+                assert_eq!(cx, cy, "ciphertext mismatch after round-trip");
             }
-            (Frame::Msg { sealed: x }, Frame::Msg { sealed: y })
-            | (Frame::PttStart { sealed: x }, Frame::PttStart { sealed: y })
-            | (Frame::PttStop { sealed: x }, Frame::PttStop { sealed: y })
-            | (Frame::Ping { sealed: x }, Frame::Ping { sealed: y })
-            | (Frame::Pong { sealed: x }, Frame::Pong { sealed: y })
-            | (Frame::Hangup { sealed: x }, Frame::Hangup { sealed: y })
-            | (Frame::Cipher { sealed: x }, Frame::Cipher { sealed: y }) => {
-                assert_eq!(x, y);
-            }
-            _ => panic!("frame variant mismatch after round-trip"),
         }
     }
 
@@ -819,6 +892,85 @@ mod tests {
                 .open(Direction::CalleeToCaller, 0, aad, &sealed_back)
                 .expect("caller opens callee-sealed frame -> keys match");
             assert_eq!(opened_back, pt);
+        });
+    }
+
+    // ---- randomized robustness (CI-safe "fuzz"; see tphone/fuzz for libfuzzer) ----
+
+    /// `read_frame` must never panic on arbitrary bytes — only ever return
+    /// `Ok(frame)` or `Err(_)`. A hostile peer controls these bytes, so a panic
+    /// would be a remote DoS. Seeded for reproducibility.
+    #[test]
+    fn read_frame_never_panics_on_random_bytes() {
+        use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0xF0_0D_C0_DE);
+        futures::executor::block_on(async {
+            for _ in 0..4000 {
+                let len = rng.gen_range(0..2048usize);
+                let mut bytes = vec![0u8; len];
+                rng.fill_bytes(&mut bytes);
+                let (mut a, mut b) = duplex();
+                a.write_all(&bytes).await.ok();
+                drop(a); // EOF so a short/truncated read terminates instead of hanging
+                // Must resolve to a Result without panicking; either arm is fine.
+                let _ = read_frame(&mut b).await;
+            }
+        });
+    }
+
+    /// Any decodable frame must survive an encode→write→read round-trip,
+    /// including adversarial seq/payload values. Builds random sealed frames.
+    #[test]
+    fn random_frames_round_trip() {
+        use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0x5EED_1234);
+        futures::executor::block_on(async {
+            for _ in 0..1500 {
+                let plen = rng.gen_range(0..512usize);
+                let mut sealed = vec![0u8; plen];
+                rng.fill_bytes(&mut sealed);
+                let seq: u64 = rng.r#gen();
+
+                let frame = match rng.gen_range(0..8u8) {
+                    0 => Frame::Audio {
+                        seq,
+                        sealed: sealed.clone(),
+                    },
+                    1 => Frame::Msg {
+                        seq,
+                        sealed: sealed.clone(),
+                    },
+                    2 => Frame::PttStart {
+                        seq,
+                        sealed: sealed.clone(),
+                    },
+                    3 => Frame::PttStop {
+                        seq,
+                        sealed: sealed.clone(),
+                    },
+                    4 => Frame::Ping {
+                        seq,
+                        sealed: sealed.clone(),
+                    },
+                    5 => Frame::Pong {
+                        seq,
+                        sealed: sealed.clone(),
+                    },
+                    6 => Frame::Hangup {
+                        seq,
+                        sealed: sealed.clone(),
+                    },
+                    _ => Frame::Cipher {
+                        seq,
+                        sealed: sealed.clone(),
+                    },
+                };
+
+                let (mut a, mut b) = duplex();
+                write_frame(&mut a, &frame).await.expect("write_frame");
+                let got = read_frame(&mut b).await.expect("read_frame");
+                assert_frame_eq(&frame, &got);
+            }
         });
     }
 

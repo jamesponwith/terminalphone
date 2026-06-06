@@ -5,3 +5,6 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# Claude Code agent worktrees (live inside the repo; never track)
+.claude/worktrees/

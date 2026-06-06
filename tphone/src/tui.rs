@@ -26,11 +26,12 @@ use std::time::Duration;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
-    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    supports_keyboard_enhancement,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode, supports_keyboard_enhancement,
 };
 use crossterm::{execute, queue};
 use tokio::sync::mpsc;
@@ -560,7 +561,11 @@ fn render_screen(s: &CallScreen) -> Result<()> {
     // Reserve 2 rows for footer (footer + blank line).
     let header_end = header.len() as u16;
     let footer_row = if let Ok((_, height)) = crossterm::terminal::size() {
-        if height > 10 { height - 2 } else { header_end + 2 }
+        if height > 10 {
+            height - 2
+        } else {
+            header_end + 2
+        }
     } else {
         header_end + 5
     };
@@ -662,18 +667,30 @@ mod tests {
     #[test]
     fn ptt_press_and_release_maps_to_start_stop() {
         let mut st = InputState::new();
-        assert_eq!(feed(&mut st, PTT, HOLD, press(' ')), vec![UiEvent::PttStart]);
-        assert_eq!(feed(&mut st, PTT, HOLD, release(' ')), vec![UiEvent::PttStop]);
+        assert_eq!(
+            feed(&mut st, PTT, HOLD, press(' ')),
+            vec![UiEvent::PttStart]
+        );
+        assert_eq!(
+            feed(&mut st, PTT, HOLD, release(' ')),
+            vec![UiEvent::PttStop]
+        );
     }
 
     #[test]
     fn ptt_hold_ignores_auto_repeat() {
         let mut st = InputState::new();
         let repeat = (KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Repeat);
-        assert_eq!(feed(&mut st, PTT, HOLD, press(' ')), vec![UiEvent::PttStart]);
+        assert_eq!(
+            feed(&mut st, PTT, HOLD, press(' ')),
+            vec![UiEvent::PttStart]
+        );
         // A held key auto-repeats; it must not re-trigger capture.
         assert_eq!(feed(&mut st, PTT, HOLD, repeat), Vec::<UiEvent>::new());
-        assert_eq!(feed(&mut st, PTT, HOLD, release(' ')), vec![UiEvent::PttStop]);
+        assert_eq!(
+            feed(&mut st, PTT, HOLD, release(' ')),
+            vec![UiEvent::PttStop]
+        );
     }
 
     #[test]
@@ -685,7 +702,10 @@ mod tests {
             vec![UiEvent::PttStart]
         );
         // No release is ever delivered; if one were, it is inert.
-        assert_eq!(feed(&mut st, PTT, TOGGLE, release(' ')), Vec::<UiEvent>::new());
+        assert_eq!(
+            feed(&mut st, PTT, TOGGLE, release(' ')),
+            Vec::<UiEvent>::new()
+        );
         assert_eq!(
             feed(&mut st, PTT, TOGGLE, press(' ')),
             vec![UiEvent::PttStop]
@@ -699,8 +719,14 @@ mod tests {
     #[test]
     fn custom_ptt_key_is_honored() {
         let mut st = InputState::new();
-        assert_eq!(feed(&mut st, 'x', HOLD, press('x')), vec![UiEvent::PttStart]);
-        assert_eq!(feed(&mut st, 'x', HOLD, release('x')), vec![UiEvent::PttStop]);
+        assert_eq!(
+            feed(&mut st, 'x', HOLD, press('x')),
+            vec![UiEvent::PttStart]
+        );
+        assert_eq!(
+            feed(&mut st, 'x', HOLD, release('x')),
+            vec![UiEvent::PttStop]
+        );
         // Space is inert when it is not the PTT key.
         assert_eq!(feed(&mut st, 'x', HOLD, press(' ')), Vec::<UiEvent>::new());
     }
@@ -721,7 +747,10 @@ mod tests {
     fn release_of_non_ptt_key_is_ignored() {
         let mut st = InputState::new();
         // A 'q' *release* must not hang up (only press does).
-        assert_eq!(feed(&mut st, PTT, HOLD, release('q')), Vec::<UiEvent>::new());
+        assert_eq!(
+            feed(&mut st, PTT, HOLD, release('q')),
+            Vec::<UiEvent>::new()
+        );
     }
 
     #[test]
