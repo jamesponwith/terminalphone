@@ -4,13 +4,13 @@
 //! ring crypto provider, initializes tracing, builds the Tokio runtime, and
 //! hands off to [`app::App::run`] (or the headless [`selftest`]).
 
+use std::path::PathBuf;
 use tphone::app::{App, Command};
 use tphone::config::{self, Config, SpeedMode};
 use tphone::crypto::Psk;
 use tphone::error::Result;
 use tphone::selftest;
 use tphone::transport::{ArtiTransport, OnionAddr};
-use std::path::PathBuf;
 
 const USAGE: &str = "\
 terminalphone — anonymous E2E push-to-talk over Tor
@@ -159,10 +159,12 @@ fn parse_args() -> std::result::Result<Action, String> {
     // Now parse the subcommand from remaining args.
     let sub = match args.first() {
         Some(s) => s.clone(),
-        None => return Ok(Action {
-            command: ActionCommand::Usage,
-            flags,
-        }),
+        None => {
+            return Ok(Action {
+                command: ActionCommand::Usage,
+                flags,
+            });
+        }
     };
 
     let command = match sub.as_str() {
