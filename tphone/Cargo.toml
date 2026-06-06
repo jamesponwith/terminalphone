@@ -47,6 +47,11 @@ cpal = "0.15"
 audiopus = "0.2"
 crossterm = "0.28"
 
+# identity sharing: render .onion as a scannable terminal QR. default-features
+# off drops the `image`/`svg` renderers (and their deps) — we render to unicode
+# half-blocks ourselves from `to_colors()`.
+qrcode = { version = "0.14", default-features = false }
+
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time", "test-util"] }
 tempfile = "3"

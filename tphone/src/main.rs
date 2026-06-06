@@ -18,11 +18,13 @@ terminalphone — anonymous E2E push-to-talk over Tor
 USAGE:
     terminalphone [OPTIONS] host
     terminalphone [OPTIONS] dial <onion>
+    terminalphone [OPTIONS] qr <onion>
     terminalphone [OPTIONS] selftest
 
 COMMANDS:
     host            Host an onion service and wait for a caller.
     dial <onion>    Dial a remote .onion and start a call.
+    qr <onion>      Render a .onion as a scannable terminal QR code and exit.
     selftest        Run a headless integrated loopback self-test (no Tor/audio).
 
 OPTIONS:
@@ -57,6 +59,8 @@ enum ActionCommand {
     Call(Command),
     /// Run the headless integrated self-test.
     SelfTest,
+    /// Render an onion as a terminal QR code and exit (no Tor/audio/data-dir).
+    Qr(OnionAddr),
     /// Print usage and exit 0.
     Usage,
 }
@@ -79,11 +83,26 @@ fn main() {
         return;
     }
 
+    // `qr` is fully offline: no Tor bootstrap, audio, data dir, or runtime needed.
+    if let ActionCommand::Qr(onion) = &action.command {
+        match tphone::qr::render_onion(onion.host()) {
+            Ok(rendered) => {
+                print!("{rendered}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Initialize logging after parsing flags (so --log level is honored).
     let log_level = action.flags.log_level.as_deref().unwrap_or("info");
+    // Honor RUST_LOG/the default env if present; otherwise build directly from
+    // the resolved level (EnvFilter::new is infallible, so no fallible convert).
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .or_else(|_| tracing_subscriber::EnvFilter::try_from(log_level))
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -181,6 +200,11 @@ fn parse_args() -> std::result::Result<Action, String> {
             let addr = OnionAddr::parse(onion).map_err(|e| e.to_string())?;
             ActionCommand::Call(Command::Dial(addr))
         }
+        "qr" => {
+            let onion = args.get(1).ok_or("`qr` requires an <onion> argument")?;
+            let addr = OnionAddr::parse(onion).map_err(|e| e.to_string())?;
+            ActionCommand::Qr(addr)
+        }
         other => return Err(format!("unknown command `{other}`")),
     };
 
@@ -190,7 +214,9 @@ fn parse_args() -> std::result::Result<Action, String> {
 /// Dispatch the parsed action.
 async fn run(command: ActionCommand, flags: Flags) -> Result<()> {
     match command {
-        ActionCommand::Usage => Ok(()),
+        // `Usage` and `Qr` are handled before the runtime is built; reaching
+        // them here would be a logic error.
+        ActionCommand::Usage | ActionCommand::Qr(_) => Ok(()),
         ActionCommand::SelfTest => {
             selftest::run().await?;
             println!("selftest: OK — tone + message round-tripped exactly");

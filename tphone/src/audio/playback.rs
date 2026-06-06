@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(s, vec![400, -400, i16::MAX, i16::MIN]);
 
         // The default playout gain is a real boost (> unity).
-        assert!(PLAYBACK_GAIN > 1.0, "playout must apply makeup gain");
+        const { assert!(PLAYBACK_GAIN > 1.0, "playout must apply makeup gain") };
     }
 
     #[test]
