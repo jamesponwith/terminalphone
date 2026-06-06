@@ -264,6 +264,8 @@ fn make_io() -> (CallIo, IoHandles) {
             msg_in,
             events_in,
             stats: std::sync::Arc::new(crate::app::CallStats::default()),
+            // No keepalive needed for the short headless self-test.
+            keepalive: std::time::Duration::from_secs(3600),
             hangup,
         },
         IoHandles {

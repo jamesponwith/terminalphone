@@ -212,6 +212,9 @@ pub struct CallIo {
     pub events_in: mpsc::Sender<CallEvent>,
     /// Shared byte counters updated by the send/recv loops, read by the UI.
     pub stats: std::sync::Arc<CallStats>,
+    /// How often to emit a keepalive `PING` during silence to keep the Tor
+    /// circuit warm. The peer answers with `PONG`; both are authenticated.
+    pub keepalive: std::time::Duration,
     /// Signalled by the user/UI to request a graceful hangup.
     pub hangup: mpsc::Receiver<()>,
 }
@@ -280,6 +283,7 @@ async fn run_interactive(
         msg_in: msg_in_tx,
         events_in: events_in_tx,
         stats: stats.clone(),
+        keepalive: std::time::Duration::from_secs(20),
         hangup,
     };
 
@@ -476,6 +480,7 @@ pub async fn run_call(
         msg_in,
         events_in,
         stats,
+        keepalive,
         hangup,
     } = io;
 
@@ -495,7 +500,7 @@ pub async fn run_call(
         ctrl_tx.clone(),
     );
     let send_fut = send_loop(
-        writer, keys, send_dir, audio_out, msg_out, ptt_out, stats, hangup, ctrl_rx,
+        writer, keys, send_dir, audio_out, msg_out, ptt_out, stats, keepalive, hangup, ctrl_rx,
     );
 
     // Whichever half finishes first decides the call outcome; the other is
@@ -638,6 +643,7 @@ async fn send_loop<W>(
     mut msg_out: mpsc::Receiver<String>,
     mut ptt_out: mpsc::Receiver<bool>,
     stats: std::sync::Arc<CallStats>,
+    keepalive: std::time::Duration,
     mut hangup: mpsc::Receiver<()>,
     mut ctrl_rx: mpsc::Receiver<ControlOut>,
 ) -> Result<()>
@@ -648,6 +654,11 @@ where
     // Stops polling the PTT channel once the UI side closes it, so a closed
     // channel doesn't spin the select with immediate `None`s.
     let mut ptt_open = true;
+    // Keepalive PING timer: fires every `keepalive` to keep the circuit warm.
+    // The first tick is immediate, so skip it to avoid an instant PING.
+    let mut ka = tokio::time::interval(keepalive);
+    ka.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ka_first = true;
     loop {
         tokio::select! {
             biased;
@@ -711,6 +722,17 @@ where
                     let seq = next(&mut send_seq);
                     let sealed = keys.seal(send_dir, seq, &[FrameTag::Pong as u8], &[]);
                     write_counted(&mut writer, &stats, Frame::Pong { seq, sealed }).await?;
+                }
+            }
+
+            _ = ka.tick() => {
+                // Skip the immediate first tick; emit a sealed PING thereafter.
+                if ka_first {
+                    ka_first = false;
+                } else {
+                    let seq = next(&mut send_seq);
+                    let sealed = keys.seal(send_dir, seq, &[FrameTag::Ping as u8], &[]);
+                    write_counted(&mut writer, &stats, Frame::Ping { seq, sealed }).await?;
                 }
             }
         }

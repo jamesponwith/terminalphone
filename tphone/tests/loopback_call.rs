@@ -82,6 +82,9 @@ fn make_endpoint() -> Endpoint {
             msg_in,
             events_in,
             stats: stats.clone(),
+            // Long by default so existing tests see no surprise keepalive PINGs;
+            // the keepalive test overrides `io.keepalive` before spawning.
+            keepalive: std::time::Duration::from_secs(3600),
             hangup,
         },
         audio_out_tx,
@@ -350,6 +353,80 @@ async fn ptt_signaling_propagates_and_stats_accrue() {
     assert!(
         callee_stats.bytes_recv.load(Ordering::Relaxed) > 0,
         "callee should have received bytes for the PTT frames"
+    );
+
+    drop(caller.audio_out_tx);
+    drop(callee.audio_out_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), caller_loop).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), callee_loop).await;
+}
+
+/// With a short keepalive interval and no user traffic, the send loop emits
+/// sealed PINGs that the peer authenticates and answers with PONG — so bytes
+/// flow in both directions during silence, keeping the circuit warm.
+#[tokio::test]
+async fn keepalive_pings_flow_during_silence() {
+    let psk = Psk::from_bytes([0x42; 32]);
+    let (mut caller_conn, mut callee_conn) = connected_pair().await;
+
+    let psk_a = psk.clone();
+    let psk_b = psk.clone();
+    let (caller_hs, callee_hs) = tokio::join!(
+        run_handshake(
+            &mut caller_conn,
+            &psk_a,
+            hello("caller.onion", 0x11),
+            Role::Caller
+        ),
+        run_handshake(
+            &mut callee_conn,
+            &psk_b,
+            hello("callee.onion", 0x22),
+            Role::Callee
+        ),
+    );
+    let (caller_keys, caller_peer) = caller_hs.expect("caller handshake");
+    let (callee_keys, callee_peer) = callee_hs.expect("callee handshake");
+
+    let mut caller = make_endpoint();
+    let mut callee = make_endpoint();
+    // Fast keepalive on both ends; override the long default before spawning.
+    caller.io.keepalive = Duration::from_millis(40);
+    callee.io.keepalive = Duration::from_millis(40);
+    let caller_stats = caller.stats.clone();
+    let callee_stats = callee.stats.clone();
+
+    let caller_loop = tokio::spawn(run_call(
+        caller_conn,
+        caller_keys,
+        Role::Caller,
+        caller_peer,
+        caller.io,
+    ));
+    let callee_loop = tokio::spawn(run_call(
+        callee_conn,
+        callee_keys,
+        Role::Callee,
+        callee_peer,
+        callee.io,
+    ));
+
+    // Without sending any audio/text, keepalive PINGs (and the PONG replies) must
+    // move bytes both ways. Poll a short while for the counters to rise.
+    use std::sync::atomic::Ordering;
+    let mut ok = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if caller_stats.bytes_recv.load(Ordering::Relaxed) > 0
+            && callee_stats.bytes_recv.load(Ordering::Relaxed) > 0
+        {
+            ok = true;
+            break;
+        }
+    }
+    assert!(
+        ok,
+        "keepalive PING/PONG should move bytes in both directions during silence"
     );
 
     drop(caller.audio_out_tx);
