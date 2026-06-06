@@ -1,3 +1,6 @@
 [workspace]
 members = ["rs-spike", "tphone"]
+# The cargo-fuzz crate is its own workspace (nightly + cargo-fuzz only); keep it
+# out of the default build/test/fmt so stable CI never touches it.
+exclude = ["tphone/fuzz"]
 resolver = "2"

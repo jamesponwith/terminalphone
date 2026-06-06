@@ -1,0 +1,33 @@
+# Standalone cargo-fuzz crate for the proto codec (tp-1u5).
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below) so the
+# root `cargo build/test/fmt --workspace` and CI never touch it — libFuzzer
+# requires a nightly toolchain and `cargo install cargo-fuzz`.
+#
+# Run:  rustup toolchain install nightly
+#       cargo install cargo-fuzz
+#       cargo +nightly fuzz run frame_decode
+[package]
+name = "tphone-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+futures = "0.3"
+
+[dependencies.tphone]
+path = ".."
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false

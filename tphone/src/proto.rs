@@ -854,6 +854,79 @@ mod tests {
         });
     }
 
+    // ---- randomized robustness (CI-safe "fuzz"; see tphone/fuzz for libfuzzer) ----
+
+    /// `read_frame` must never panic on arbitrary bytes — only ever return
+    /// `Ok(frame)` or `Err(_)`. A hostile peer controls these bytes, so a panic
+    /// would be a remote DoS. Seeded for reproducibility.
+    #[test]
+    fn read_frame_never_panics_on_random_bytes() {
+        use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0xF0_0D_C0_DE);
+        futures::executor::block_on(async {
+            for _ in 0..4000 {
+                let len = rng.gen_range(0..2048usize);
+                let mut bytes = vec![0u8; len];
+                rng.fill_bytes(&mut bytes);
+                let (mut a, mut b) = duplex();
+                a.write_all(&bytes).await.ok();
+                drop(a); // EOF so a short/truncated read terminates instead of hanging
+                // Must resolve to a Result without panicking; either arm is fine.
+                let _ = read_frame(&mut b).await;
+            }
+        });
+    }
+
+    /// Any decodable frame must survive an encode→write→read round-trip,
+    /// including adversarial seq/payload values. Builds random sealed frames.
+    #[test]
+    fn random_frames_round_trip() {
+        use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0x5EED_1234);
+        futures::executor::block_on(async {
+            for _ in 0..1500 {
+                let plen = rng.gen_range(0..512usize);
+                let mut sealed = vec![0u8; plen];
+                rng.fill_bytes(&mut sealed);
+                let seq: u64 = rng.r#gen();
+
+                let frame = match rng.gen_range(0..8u8) {
+                    0 => Frame::Audio {
+                        seq,
+                        sealed: sealed.clone(),
+                    },
+                    1 => Frame::Msg {
+                        seq,
+                        sealed: sealed.clone(),
+                    },
+                    2 => Frame::PttStart {
+                        sealed: sealed.clone(),
+                    },
+                    3 => Frame::PttStop {
+                        sealed: sealed.clone(),
+                    },
+                    4 => Frame::Ping {
+                        sealed: sealed.clone(),
+                    },
+                    5 => Frame::Pong {
+                        sealed: sealed.clone(),
+                    },
+                    6 => Frame::Hangup {
+                        sealed: sealed.clone(),
+                    },
+                    _ => Frame::Cipher {
+                        sealed: sealed.clone(),
+                    },
+                };
+
+                let (mut a, mut b) = duplex();
+                write_frame(&mut a, &frame).await.expect("write_frame");
+                let got = read_frame(&mut b).await.expect("read_frame");
+                assert_frame_eq(&frame, &got);
+            }
+        });
+    }
+
     #[test]
     fn handshake_suite_mismatch_errors() {
         futures::executor::block_on(async {
