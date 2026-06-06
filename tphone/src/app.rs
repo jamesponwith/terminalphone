@@ -482,19 +482,13 @@ where
                     Err(e) => return Err(e),
                 }
             }
-            Frame::Msg { sealed } => {
+            Frame::Msg { seq, sealed } => {
                 // MSG shares the per-direction replay window with AUDIO, so it
-                // must carry its own sequence rather than reusing seq 0 (which an
-                // earlier AUDIO frame would have already consumed). The frozen
-                // `Frame::Msg { sealed }` wire shape has no seq field, so the
-                // 8-byte big-endian seq is prefixed (in plaintext) ahead of the
-                // ciphertext, exactly as AUDIO prefixes its seq.
-                let Some((seq, ct)) = split_seq_prefix(&sealed) else {
-                    tracing::debug!("dropping MSG frame too short to hold a seq prefix");
-                    continue;
-                };
+                // carries its own sequence (a real `Frame::Msg` field, drawn from
+                // the same monotonic counter) rather than reusing seq 0 that an
+                // earlier AUDIO frame would already have consumed.
                 let aad = [FrameTag::Msg as u8];
-                match keys.open(recv_dir, seq, &aad, ct) {
+                match keys.open(recv_dir, seq, &aad, &sealed) {
                     Ok(pt) => {
                         let text = String::from_utf8_lossy(&pt).into_owned();
                         let _ = msg_in.send(text).await;
@@ -567,12 +561,13 @@ where
             maybe = msg_out.recv() => {
                 if let Some(text) = maybe {
                     // Draw from the shared monotonic counter so MSG and AUDIO
-                    // never collide in the receiver's replay window, then prefix
-                    // the seq (plaintext) ahead of the ciphertext.
+                    // never collide in the receiver's replay window. The seq is a
+                    // real `Frame::Msg` field carried on the wire (proto encodes
+                    // it as an 8-byte prefix, exactly like AUDIO).
                     let seq = next(&mut send_seq);
                     let aad = [FrameTag::Msg as u8];
-                    let sealed = with_seq_prefix(seq, keys.seal(send_dir, seq, &aad, text.as_bytes()));
-                    proto::write_frame(&mut writer, &Frame::Msg { sealed }).await?;
+                    let sealed = keys.seal(send_dir, seq, &aad, text.as_bytes());
+                    proto::write_frame(&mut writer, &Frame::Msg { seq, sealed }).await?;
                 }
             }
 
@@ -602,25 +597,4 @@ fn next(seq: &mut u64) -> u64 {
     let s = *seq;
     *seq = seq.wrapping_add(1);
     s
-}
-
-/// Prefix an 8-byte big-endian sequence ahead of a sealed payload, so frames
-/// whose frozen wire shape carries no seq field (e.g. `Frame::Msg`) can still be
-/// opened at the right sequence and tracked in the shared replay window.
-fn with_seq_prefix(seq: u64, ciphertext: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + ciphertext.len());
-    out.extend_from_slice(&seq.to_be_bytes());
-    out.extend_from_slice(&ciphertext);
-    out
-}
-
-/// Split an 8-byte big-endian sequence prefix off a sealed payload produced by
-/// [`with_seq_prefix`]. Returns `None` if the payload is too short to hold one.
-fn split_seq_prefix(payload: &[u8]) -> Option<(u64, &[u8])> {
-    if payload.len() < 8 {
-        return None;
-    }
-    let mut seq_bytes = [0u8; 8];
-    seq_bytes.copy_from_slice(&payload[..8]);
-    Some((u64::from_be_bytes(seq_bytes), &payload[8..]))
 }

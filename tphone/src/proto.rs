@@ -168,9 +168,13 @@ pub enum Frame {
         /// AEAD-sealed Opus payload.
         sealed: Vec<u8>,
     },
-    /// Sealed UTF-8 text message.
+    /// Sealed UTF-8 text message with its per-direction sequence.
     Msg {
-        /// Sealed text bytes.
+        /// Monotonic frame sequence (also bound into AAD), drawn from the same
+        /// per-direction counter as `Audio` so the two never collide in the
+        /// receiver's replay window.
+        seq: Seq,
+        /// AEAD-sealed text bytes.
         sealed: Vec<u8>,
     },
     /// Sealed PTT-start control.
@@ -222,20 +226,16 @@ impl Frame {
     }
 
     /// Serialize the frame *payload* (the bytes that follow the `ver|type|len`
-    /// header). For `Audio` the 8-byte big-endian sequence is prefixed ahead of
-    /// the sealed ciphertext; all other sealed variants are the raw ciphertext;
-    /// `Hello` is the encoded plaintext HELLO body.
+    /// header). For `Audio` and `Msg` the 8-byte big-endian sequence is prefixed
+    /// ahead of the sealed ciphertext; all other sealed variants are the raw
+    /// ciphertext; `Hello` is the encoded plaintext HELLO body.
     fn encode_payload(&self) -> Vec<u8> {
         match self {
             Frame::Hello(h) => h.encode(),
-            Frame::Audio { seq, sealed } => {
-                let mut buf = Vec::with_capacity(8 + sealed.len());
-                buf.extend_from_slice(&seq.to_be_bytes());
-                buf.extend_from_slice(sealed);
-                buf
+            Frame::Audio { seq, sealed } | Frame::Msg { seq, sealed } => {
+                encode_seq_payload(*seq, sealed)
             }
-            Frame::Msg { sealed }
-            | Frame::PttStart { sealed }
+            Frame::PttStart { sealed }
             | Frame::PttStop { sealed }
             | Frame::Ping { sealed }
             | Frame::Pong { sealed }
@@ -249,18 +249,13 @@ impl Frame {
         Ok(match ty {
             FrameType::Hello => Frame::Hello(Hello::decode(&payload)?),
             FrameType::Audio => {
-                if payload.len() < 8 {
-                    return Err(Error::Proto(
-                        "AUDIO frame too short to hold an 8-byte sequence".into(),
-                    ));
-                }
-                let mut seq_bytes = [0u8; 8];
-                seq_bytes.copy_from_slice(&payload[..8]);
-                let seq = u64::from_be_bytes(seq_bytes);
-                let sealed = payload[8..].to_vec();
+                let (seq, sealed) = decode_seq_payload(&payload, "AUDIO")?;
                 Frame::Audio { seq, sealed }
             }
-            FrameType::Msg => Frame::Msg { sealed: payload },
+            FrameType::Msg => {
+                let (seq, sealed) = decode_seq_payload(&payload, "MSG")?;
+                Frame::Msg { seq, sealed }
+            }
             FrameType::PttStart => Frame::PttStart { sealed: payload },
             FrameType::PttStop => Frame::PttStop { sealed: payload },
             FrameType::Ping => Frame::Ping { sealed: payload },
@@ -269,6 +264,29 @@ impl Frame {
             FrameType::Cipher => Frame::Cipher { sealed: payload },
         })
     }
+}
+
+/// Encode a sealed payload that carries an 8-byte big-endian sequence prefix
+/// (used by `Audio` and `Msg`, which share the per-direction replay sequence).
+fn encode_seq_payload(seq: Seq, sealed: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + sealed.len());
+    buf.extend_from_slice(&seq.to_be_bytes());
+    buf.extend_from_slice(sealed);
+    buf
+}
+
+/// Split the 8-byte big-endian sequence prefix off a `Audio`/`Msg` payload.
+/// `what` names the frame type for the truncation error message.
+fn decode_seq_payload(payload: &[u8], what: &str) -> Result<(Seq, Vec<u8>)> {
+    if payload.len() < 8 {
+        return Err(Error::Proto(format!(
+            "{what} frame too short to hold an 8-byte sequence"
+        )));
+    }
+    let mut seq_bytes = [0u8; 8];
+    seq_bytes.copy_from_slice(&payload[..8]);
+    let seq = Seq::from_be_bytes(seq_bytes);
+    Ok((seq, payload[8..].to_vec()))
 }
 
 /// Write one frame to `w` in the `ver|type|len|payload` format.
@@ -630,7 +648,12 @@ mod tests {
                 sealed: Vec::new(),
             },
             Frame::Msg {
+                seq: 0x0000_0000_0000_0007,
                 sealed: sealed.clone(),
+            },
+            Frame::Msg {
+                seq: 0,
+                sealed: Vec::new(),
             },
             Frame::PttStart {
                 sealed: sealed.clone(),
@@ -669,12 +692,21 @@ mod tests {
                     seq: sy,
                     sealed: cy,
                 },
+            )
+            | (
+                Frame::Msg {
+                    seq: sx,
+                    sealed: cx,
+                },
+                Frame::Msg {
+                    seq: sy,
+                    sealed: cy,
+                },
             ) => {
                 assert_eq!(sx, sy);
                 assert_eq!(cx, cy);
             }
-            (Frame::Msg { sealed: x }, Frame::Msg { sealed: y })
-            | (Frame::PttStart { sealed: x }, Frame::PttStart { sealed: y })
+            (Frame::PttStart { sealed: x }, Frame::PttStart { sealed: y })
             | (Frame::PttStop { sealed: x }, Frame::PttStop { sealed: y })
             | (Frame::Ping { sealed: x }, Frame::Ping { sealed: y })
             | (Frame::Pong { sealed: x }, Frame::Pong { sealed: y })
