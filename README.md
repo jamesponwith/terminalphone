@@ -74,20 +74,21 @@ issue status is authoritative in beads (`bd ready`).
 |---|---|---|
 | **M0** | arti onion-service spike (host + dial round-trip) | ✅ done |
 | **M1** | Vertical slice: a real encrypted two-way PTT call over Tor | ✅ core complete |
-| **M2** | Security & robustness: speed/anonymity modes, in-call text, hardening | 🚧 in progress |
-| **M3** | Feature parity with v1.1.6 (relay, QR, voice changer, chime, hop display, …) | ⏳ planned |
+| **M2** | Security & robustness: speed/anonymity modes, in-call text, secret-at-rest, codec fuzzing | 🚧 mostly landed |
+| **M3** | Feature parity with v1.1.6 (QR + voice changer landed; relay, chime, hop display, … remain) | 🚧 in progress |
 | **M4** | Zero-knowledge group relay (N callers) | ⏳ planned |
 | **M5** | Android/Termux audio, pluggable-transport bridges, signed reproducible builds | ⏳ planned |
 
 **Working today:** hosting and dialing a real onion service over embedded Tor, a
 clear two-way push-to-talk call with authenticated per-call encryption, in-call
-encrypted text, the gated single-hop-service warning, and a headless self-test
-that exercises the whole encode → seal → wire → open → decode pipeline without a
-microphone or a Tor circuit.
+encrypted text, the gated single-hop-service warning, passphrase-protected
+secret-at-rest (Argon2id), a voice changer, QR identity sharing, and a headless
+self-test that exercises the whole encode → seal → wire → open → decode pipeline
+without a microphone or a Tor circuit.
 
-**Not yet ported from v1:** group relay mode, QR identity sharing, voice changer,
-PTT chime presets, circuit-hop display, country exclusion, Snowflake bridges, and
-the Termux/Android audio path. These are the M3–M5 queue.
+**Not yet ported from v1:** group relay mode, PTT chime presets, circuit-hop
+display, country exclusion, Snowflake bridges, and the Termux/Android audio path.
+These are the remaining M3–M5 queue.
 
 ---
 
@@ -171,6 +172,7 @@ USAGE:
 |---|---|
 | `host` | Host an onion service and wait for a caller. Prints your `.onion`. |
 | `dial <onion>` | Dial a remote `.onion` and start a call. |
+| `qr <onion>` | Render a `.onion` as a scannable terminal QR code and exit (offline; no Tor/audio). |
 | `selftest` | Run a headless integrated loopback self-test (no Tor, no audio). |
 
 ### Options
@@ -181,6 +183,12 @@ USAGE:
 | `--data-dir <path>` | Data directory. Default: `$TERMINALPHONE_DIR`, else `$HOME/.terminalphone`. |
 | `--speed <mode>` | `speed_first` (default), `full_anonymity`, or `single_hop_service`. See [Speed vs. Anonymity](#speed-vs-anonymity). |
 | `--log <level>` | `trace`, `debug`, `info` (default), `warn`, `error`. Also honors `RUST_LOG`. |
+
+**Environment:** set `TERMINALPHONE_PASSPHRASE` to protect the on-disk secret.
+On first run the generated PSK is stored encrypted (Argon2id + AES-256-GCM); if a
+plaintext secret already exists it is migrated to the wrapped format in place; an
+already-wrapped secret is unlocked with it (or via an interactive prompt on a
+TTY). See [Security Model](#security-model).
 
 ### In-Call Controls
 
@@ -273,6 +281,13 @@ connection cannot be attributed to either party by a network observer.
 PSK mismatch — aborts the call with an explicit error rather than connecting
 silently.
 
+**Secret at rest.** The PSK can be encrypted on disk with a passphrase
+(`TERMINALPHONE_PASSPHRASE`): the key is wrapped with **AES-256-GCM** under an
+**Argon2id**-stretched key-encryption key (stronger than v1's PBKDF2), with the
+format header bound in as AAD. A plaintext secret is migrated to the wrapped
+format in place the first time a passphrase is provided. Without a passphrase the
+secret is a bare 32-byte key at mode `0600`.
+
 **Cleanup.** Graceful `HANGUP` tears down the circuit on both sides, and key
 material is zeroized (`zeroize`) on drop.
 
@@ -295,8 +310,8 @@ material is zeroized (`zeroize`) on drop.
   using it can be decrypted. Optional X25519 ECDH mixed into the HKDF is a
   pending design decision.
 - The protocol does not protect a **compromised endpoint**.
-- **Passphrase-at-rest** for the PSK (Argon2id wrap) is specified but deferred to
-  M2; today the on-disk secret is a bare 32-byte key at mode `0600`.
+- **Passphrase-at-rest** is opt-in (`TERMINALPHONE_PASSPHRASE`). With no
+  passphrase set, the secret is stored as a bare 32-byte key at mode `0600`.
 
 ---
 
@@ -333,6 +348,7 @@ else `$HOME/.terminalphone`):
 | `aead_suite` | `Aes256Gcm` | AEAD cipher (`Aes256Gcm` or `ChaCha20Poly1305`). |
 | `ptt_key` | `' '` (SPACE) | Push-to-talk key. |
 | `speed_mode` | `SpeedFirst` | Hop/anonymity posture (see above). |
+| `voice_effect` | `off` | Outgoing voice changer: `off`, `robot`, `tremolo`, `overdrive`, `telephone`, `whisper`. |
 | `jitter_lead_ms` | `250` | Playback lead buffered before audio starts. |
 | `app_port` | `7777` | Application port carried inside the onion circuit. |
 | `[opus]` `sample_rate` | `16000` | Audio sample rate in Hz (`8000` for constrained links). |
@@ -356,7 +372,8 @@ src/
   crypto.rs     PSK; HKDF per-call key; AES-256-GCM | ChaCha20-Poly1305 seal/open
   proto.rs      wire frame codec + HELLO handshake; seq/AAD binding
   transport/    Transport trait + arti impl (onion host/dial, identity, keepalive)
-  audio/        cpal capture/playback + audiopus codec + jitter buffer
+  audio/        cpal capture/playback + audiopus codec + jitter buffer + voice DSP
+  qr.rs         render a .onion as a terminal QR for identity sharing
   tui.rs        raw-mode PTT input; call-screen render
 ```
 
