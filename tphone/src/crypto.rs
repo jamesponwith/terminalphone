@@ -83,6 +83,142 @@ impl Psk {
     }
 }
 
+// ---- Secret-at-rest: passphrase-wrapped PSK (SPEC §5.2, ADR-0004) ----------
+//
+// The on-disk `secret` is either a bare 32-byte PSK (first-run default) or a
+// passphrase-wrapped blob in the format below. The two are told apart by the
+// magic prefix (a bare PSK is exactly 32 bytes and cannot begin with it and be
+// the right length). Wrapping derives a 32-byte key from the passphrase with
+// **Argon2id** and seals the PSK with **AES-256-GCM**; the magic + Argon2
+// parameters + salt are bound in as AAD so they cannot be tampered with.
+//
+//   magic    : b"TPSKW1"  (6 bytes)   — TerminalPhone Secret Key Wrapped, v1
+//   m_cost   : u32 BE                  — Argon2 memory cost (KiB)
+//   t_cost   : u32 BE                  — Argon2 time cost (iterations)
+//   p_cost   : u32 BE                  — Argon2 parallelism
+//   salt     : [u8; 16]               — Argon2 salt
+//   nonce    : [u8; 12]               — AES-256-GCM nonce
+//   ct       : [u8; 48]               — sealed 32-byte PSK + 16-byte tag
+
+/// Magic prefix identifying a passphrase-wrapped secret file.
+pub const WRAPPED_MAGIC: &[u8; 6] = b"TPSKW1";
+
+/// Header length: magic(6) + 3×u32(12) + salt(16) + nonce(12) = 46 bytes.
+const WRAP_HEADER_LEN: usize = 6 + 12 + 16 + 12;
+/// Total wrapped blob length: header(46) + sealed PSK (32 + 16-byte tag) = 94.
+const WRAP_TOTAL_LEN: usize = WRAP_HEADER_LEN + 32 + 16;
+
+/// True if `blob` looks like a passphrase-wrapped secret (magic + exact length).
+/// A bare 32-byte PSK returns `false`.
+pub fn is_wrapped(blob: &[u8]) -> bool {
+    blob.len() == WRAP_TOTAL_LEN && blob.starts_with(WRAPPED_MAGIC)
+}
+
+/// Encrypt `psk` under `passphrase` into the on-disk wrapped format.
+///
+/// Uses Argon2id (default OWASP-ish params) to stretch the passphrase, then
+/// AES-256-GCM to seal the 32-byte key. Far stronger than v1's PBKDF2-100k.
+pub fn wrap_psk(psk: &Psk, passphrase: &str) -> Result<Vec<u8>> {
+    let params = argon2::Params::DEFAULT;
+    let (m_cost, t_cost, p_cost) = (params.m_cost(), params.t_cost(), params.p_cost());
+    let salt = random_16();
+    let nonce = random_12();
+
+    let mut header = Vec::with_capacity(WRAP_HEADER_LEN);
+    header.extend_from_slice(WRAPPED_MAGIC);
+    header.extend_from_slice(&m_cost.to_be_bytes());
+    header.extend_from_slice(&t_cost.to_be_bytes());
+    header.extend_from_slice(&p_cost.to_be_bytes());
+    header.extend_from_slice(&salt);
+    header.extend_from_slice(&nonce);
+
+    let mut kek = derive_kek(passphrase, &salt, m_cost, t_cost, p_cost)?;
+
+    // Seal the PSK with the KEK; bind the header (magic + params + salt + nonce)
+    // as AAD so a tampered header fails authentication on unwrap.
+    let ct = aead_encrypt(AeadSuite::Aes256Gcm, &kek, &nonce, &header, &psk.0)
+        .map_err(|_| Error::Crypto("wrapping the PSK failed".into()))?;
+    kek.zeroize();
+
+    let mut out = header;
+    out.extend_from_slice(&ct);
+    debug_assert_eq!(out.len(), WRAP_TOTAL_LEN);
+    Ok(out)
+}
+
+/// Decrypt a wrapped secret `blob` with `passphrase`, recovering the PSK.
+///
+/// Returns [`Error::Crypto`] on a malformed blob and [`Error::AuthFailed`] on a
+/// wrong passphrase or a tampered blob (so the two are distinguishable).
+pub fn unwrap_psk(blob: &[u8], passphrase: &str) -> Result<Psk> {
+    if !is_wrapped(blob) {
+        return Err(Error::Crypto(
+            "secret is not in the wrapped format (bad magic or length)".into(),
+        ));
+    }
+    let header = &blob[..WRAP_HEADER_LEN];
+    let ct = &blob[WRAP_HEADER_LEN..];
+
+    // Fixed offsets (length + magic already validated by `is_wrapped`):
+    // magic[0..6], m_cost[6..10], t_cost[10..14], p_cost[14..18],
+    // salt[18..34], nonce[34..46].
+    let be = |o: usize| u32::from_be_bytes([blob[o], blob[o + 1], blob[o + 2], blob[o + 3]]);
+    let m_cost = be(6);
+    let t_cost = be(10);
+    let p_cost = be(14);
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&blob[18..34]);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&blob[34..46]);
+
+    let mut kek = derive_kek(passphrase, &salt, m_cost, t_cost, p_cost)?;
+    let pt = aead_decrypt(AeadSuite::Aes256Gcm, &kek, &nonce, header, ct);
+    kek.zeroize();
+
+    let pt = pt.map_err(|_| Error::AuthFailed)?;
+    if pt.len() != 32 {
+        return Err(Error::Crypto("unwrapped PSK is not 32 bytes".into()));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&pt);
+    Ok(Psk::from_bytes(key))
+}
+
+/// Stretch `passphrase` into a 32-byte key-encryption key via Argon2id.
+fn derive_kek(
+    passphrase: &str,
+    salt: &[u8; 16],
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u32,
+) -> Result<[u8; 32]> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    let params = Params::new(m_cost, t_cost, p_cost, Some(32))
+        .map_err(|e| Error::Crypto(format!("invalid Argon2 params: {e}")))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut kek = [0u8; 32];
+    argon2
+        .hash_password_into(passphrase.as_bytes(), salt, &mut kek)
+        .map_err(|e| Error::Crypto(format!("Argon2id derivation failed: {e}")))?;
+    Ok(kek)
+}
+
+/// Fill 16 bytes from the OS CSPRNG (Argon2 salt).
+fn random_16() -> [u8; 16] {
+    use rand::RngCore;
+    let mut buf = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    buf
+}
+
+/// Fill 12 bytes from the OS CSPRNG (AES-GCM nonce).
+fn random_12() -> [u8; 12] {
+    use rand::RngCore;
+    let mut buf = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    buf
+}
+
 /// Each side's random 32-byte HELLO nonce; salts the per-call HKDF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallNonce(pub [u8; 32]);
@@ -856,5 +992,81 @@ mod tests {
     #[test]
     fn call_key_info_is_protocol_string() {
         assert_eq!(CALL_KEY_INFO, b"terminalphone/v2 call-key");
+    }
+
+    // ---- secret-at-rest: passphrase wrapping ------------------------------
+
+    #[test]
+    fn wrap_unwrap_roundtrips() {
+        let psk = Psk::from_bytes([0x5au8; 32]);
+        let blob = wrap_psk(&psk, "correct horse battery staple").unwrap();
+        assert!(is_wrapped(&blob));
+        assert!(blob.starts_with(WRAPPED_MAGIC));
+        // The plaintext key must not appear verbatim in the blob.
+        assert!(
+            blob.windows(32).all(|w| w != psk.0),
+            "wrapped blob leaks the raw PSK"
+        );
+        let out = unwrap_psk(&blob, "correct horse battery staple").unwrap();
+        assert_eq!(out.0, psk.0);
+    }
+
+    #[test]
+    fn unwrap_wrong_passphrase_is_auth_failed() {
+        let psk = Psk::from_bytes([0x11u8; 32]);
+        let blob = wrap_psk(&psk, "right").unwrap();
+        assert!(matches!(unwrap_psk(&blob, "wrong"), Err(Error::AuthFailed)));
+    }
+
+    #[test]
+    fn unwrap_tampered_blob_is_auth_failed() {
+        let psk = Psk::from_bytes([0x22u8; 32]);
+        let mut blob = wrap_psk(&psk, "pw").unwrap();
+        // Flip a byte in the ciphertext region.
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+        assert!(matches!(unwrap_psk(&blob, "pw"), Err(Error::AuthFailed)));
+    }
+
+    #[test]
+    fn unwrap_tampered_header_is_rejected() {
+        // The header (params/salt/nonce) is AAD-bound, so altering it fails auth.
+        let psk = Psk::from_bytes([0x33u8; 32]);
+        let mut blob = wrap_psk(&psk, "pw").unwrap();
+        blob[18] ^= 0xff; // first salt byte
+        assert!(unwrap_psk(&blob, "pw").is_err());
+    }
+
+    #[test]
+    fn is_wrapped_rejects_bare_psk() {
+        let bare = [0u8; 32];
+        assert!(!is_wrapped(&bare));
+        // A 32-byte buffer that happens to start with the magic is still not
+        // wrapped (wrong length).
+        let mut spoof = WRAPPED_MAGIC.to_vec();
+        spoof.extend_from_slice(&[0u8; 26]);
+        assert_eq!(spoof.len(), 32);
+        assert!(!is_wrapped(&spoof));
+    }
+
+    #[test]
+    fn unwrap_rejects_non_wrapped_input() {
+        assert!(matches!(
+            unwrap_psk(&[0u8; 32], "pw"),
+            Err(Error::Crypto(_))
+        ));
+    }
+
+    #[test]
+    fn distinct_salts_yield_distinct_blobs() {
+        let psk = Psk::from_bytes([0x44u8; 32]);
+        let a = wrap_psk(&psk, "pw").unwrap();
+        let b = wrap_psk(&psk, "pw").unwrap();
+        assert_ne!(a, b, "random salt/nonce must make each wrap unique");
+        // Both still decrypt to the same key.
+        assert_eq!(
+            unwrap_psk(&a, "pw").unwrap().0,
+            unwrap_psk(&b, "pw").unwrap().0
+        );
     }
 }
