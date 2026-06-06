@@ -34,6 +34,7 @@
 pub mod capture;
 pub mod codec;
 pub mod playback;
+pub mod voice;
 
 // Re-export the submodule facades the app builds against.
 pub use capture::Capture;
@@ -47,6 +48,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use crate::audio::voice::{VoiceEffect, VoiceState};
 use crate::config::OpusParams;
 use crate::error::{Error, Result};
 
@@ -69,6 +71,9 @@ pub struct OpusFrame {
 pub struct AudioConfig {
     /// Opus encode/decode parameters.
     pub opus: OpusParams,
+    /// Outgoing-voice effect applied to captured PCM before encode (tp-5xj).
+    /// [`VoiceEffect::Off`] (the default) leaves the capture path unchanged.
+    pub voice_effect: VoiceEffect,
 }
 
 /// How long the playback jitter buffer leads before playout begins. Mirrors
@@ -225,6 +230,8 @@ fn capture_thread(
     };
     let _ = ready_tx.send(Ok(()));
 
+    // Cross-frame DSP state for the outgoing-voice effect; unused when off.
+    let mut voice_state = VoiceState::new();
     let poll = Duration::from_millis((cfg.opus.frame_ms as u64 / 2).max(1));
     loop {
         // Drain commands without blocking.
@@ -237,8 +244,15 @@ fn capture_thread(
             }
         }
         let mut produced = false;
-        while let Some(pcm) = cap.next_frame() {
+        while let Some(mut pcm) = cap.next_frame() {
             produced = true;
+            // Apply the voice changer in place before encoding (no-op when off).
+            voice::apply_i16(
+                cfg.voice_effect,
+                &mut pcm.samples,
+                cfg.opus.sample_rate,
+                &mut voice_state,
+            );
             match encoder.encode(&pcm) {
                 Ok(frame) => {
                     if frame_tx.send(frame).is_err() {
@@ -389,6 +403,8 @@ impl AudioBackend for SyntheticBackend {
             phase: 0,
             gate: false,
             encoder,
+            voice_effect: cfg.voice_effect,
+            voice_state: VoiceState::new(),
         }))
     }
 
@@ -417,6 +433,10 @@ struct SyntheticCaptureSource {
     gate: bool,
     /// Encoder owned by this source (single-threaded use).
     encoder: OpusEncoder,
+    /// Outgoing-voice effect applied before encode (no-op when off).
+    voice_effect: VoiceEffect,
+    /// Cross-frame DSP state for the voice effect.
+    voice_state: VoiceState,
 }
 
 impl CaptureSource for SyntheticCaptureSource {
@@ -440,6 +460,12 @@ impl CaptureSource for SyntheticCaptureSource {
             samples.push(v as i16);
             self.phase = self.phase.wrapping_add(1);
         }
+        voice::apply_i16(
+            self.voice_effect,
+            &mut samples,
+            self.sample_rate,
+            &mut self.voice_state,
+        );
         match self.encoder.encode(&PcmFrame { samples }) {
             Ok(frame) => Some(frame),
             Err(e) => {
@@ -668,6 +694,7 @@ mod tests {
     fn cfg() -> AudioConfig {
         AudioConfig {
             opus: OpusParams::default(),
+            voice_effect: VoiceEffect::default(),
         }
     }
 

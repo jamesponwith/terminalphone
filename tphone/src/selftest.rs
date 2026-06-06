@@ -36,7 +36,10 @@ const TEST_PSK: [u8; 32] = [0x42; 32];
 /// Run the headless integrated self-test. Returns `Ok(())` on an exact match.
 pub async fn run() -> Result<()> {
     let opus = OpusParams::default();
-    let audio_cfg = AudioConfig { opus };
+    let audio_cfg = AudioConfig {
+        opus,
+        voice_effect: crate::audio::voice::VoiceEffect::default(),
+    };
 
     // --- Transport pair over loopback (no Tor). ---
     let (mut caller_conn, mut callee_conn) = connected_pair().await?;

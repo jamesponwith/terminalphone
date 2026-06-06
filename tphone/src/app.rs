@@ -234,7 +234,10 @@ async fn run_interactive(
     use crate::tui::{CallScreen, Tui, UiEvent};
 
     // Bring up audio first so a missing device fails before we touch the UI.
-    let engine = AudioEngine::start(AudioConfig { opus: cfg.opus })?;
+    let engine = AudioEngine::start(AudioConfig {
+        opus: cfg.opus,
+        voice_effect: cfg.voice_effect,
+    })?;
 
     // Channels into the call core.
     let (audio_out_tx, audio_out) = mpsc::channel::<OpusFrame>(64);
