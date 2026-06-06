@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use tphone::app::{CallIo, Role, run_call, run_handshake};
+use tphone::app::{CallEvent, CallIo, Role, run_call, run_handshake};
 use tphone::audio::OpusFrame;
 use tphone::config::OpusParams;
 use tphone::crypto::{AeadSuite, CallNonce, Psk};
@@ -53,8 +53,13 @@ struct Endpoint {
     io: CallIo,
     audio_out_tx: mpsc::Sender<OpusFrame>,
     msg_out_tx: mpsc::Sender<String>,
+    #[allow(dead_code)]
+    ptt_out_tx: mpsc::Sender<bool>,
     audio_in_rx: mpsc::Receiver<OpusFrame>,
     msg_in_rx: mpsc::Receiver<String>,
+    events_in_rx: mpsc::Receiver<CallEvent>,
+    /// Shared byte counters (same Arc handed to the call loop).
+    stats: std::sync::Arc<tphone::app::CallStats>,
     #[allow(dead_code)]
     hangup_tx: mpsc::Sender<()>,
 }
@@ -62,21 +67,30 @@ struct Endpoint {
 fn make_endpoint() -> Endpoint {
     let (audio_out_tx, audio_out) = mpsc::channel(64);
     let (msg_out_tx, msg_out) = mpsc::channel(8);
+    let (ptt_out_tx, ptt_out) = mpsc::channel(8);
     let (audio_in, audio_in_rx) = mpsc::channel(64);
     let (msg_in, msg_in_rx) = mpsc::channel(8);
+    let (events_in, events_in_rx) = mpsc::channel(16);
     let (hangup_tx, hangup) = mpsc::channel(1);
+    let stats = std::sync::Arc::new(tphone::app::CallStats::default());
     Endpoint {
         io: CallIo {
             audio_out,
             msg_out,
+            ptt_out,
             audio_in,
             msg_in,
+            events_in,
+            stats: stats.clone(),
             hangup,
         },
         audio_out_tx,
         msg_out_tx,
+        ptt_out_tx,
         audio_in_rx,
         msg_in_rx,
+        events_in_rx,
+        stats,
         hangup_tx,
     }
 }
@@ -252,6 +266,90 @@ async fn wrong_psk_peer_cannot_open_frames() {
     assert!(
         msg.is_err(),
         "wrong-PSK peer must NOT receive any message (got {msg:?})"
+    );
+
+    drop(caller.audio_out_tx);
+    drop(callee.audio_out_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), caller_loop).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), callee_loop).await;
+}
+
+/// PTT start/stop signaling propagates end-to-end through the authenticated
+/// control-frame path (sealed + opened), surfacing as `CallEvent::RemotePtt` on
+/// the peer, and byte stats accrue on both ends.
+#[tokio::test]
+async fn ptt_signaling_propagates_and_stats_accrue() {
+    let psk = Psk::from_bytes([0x42; 32]);
+    let (mut caller_conn, mut callee_conn) = connected_pair().await;
+
+    let psk_a = psk.clone();
+    let psk_b = psk.clone();
+    let (caller_hs, callee_hs) = tokio::join!(
+        run_handshake(
+            &mut caller_conn,
+            &psk_a,
+            hello("caller.onion", 0x11),
+            Role::Caller
+        ),
+        run_handshake(
+            &mut callee_conn,
+            &psk_b,
+            hello("callee.onion", 0x22),
+            Role::Callee
+        ),
+    );
+    let (caller_keys, caller_peer) = caller_hs.expect("caller handshake");
+    let (callee_keys, callee_peer) = callee_hs.expect("callee handshake");
+
+    let caller = make_endpoint();
+    let mut callee = make_endpoint();
+    let caller_stats = caller.stats.clone();
+    let callee_stats = callee.stats.clone();
+
+    let caller_loop = tokio::spawn(run_call(
+        caller_conn,
+        caller_keys,
+        Role::Caller,
+        caller_peer,
+        caller.io,
+    ));
+    let callee_loop = tokio::spawn(run_call(
+        callee_conn,
+        callee_keys,
+        Role::Callee,
+        callee_peer,
+        callee.io,
+    ));
+
+    // Caller signals PTT start, then stop; the callee must observe both, in order.
+    caller.ptt_out_tx.send(true).await.unwrap();
+    let ev = tokio::time::timeout(Duration::from_secs(5), callee.events_in_rx.recv())
+        .await
+        .expect("no PTT_START event in time")
+        .expect("events channel closed");
+    assert!(
+        matches!(ev, CallEvent::RemotePtt(true)),
+        "expected RemotePtt(true), got {ev:?}"
+    );
+
+    caller.ptt_out_tx.send(false).await.unwrap();
+    let ev = tokio::time::timeout(Duration::from_secs(5), callee.events_in_rx.recv())
+        .await
+        .expect("no PTT_STOP event in time")
+        .expect("events channel closed");
+    assert!(
+        matches!(ev, CallEvent::RemotePtt(false)),
+        "expected RemotePtt(false), got {ev:?}"
+    );
+
+    use std::sync::atomic::Ordering;
+    assert!(
+        caller_stats.bytes_sent.load(Ordering::Relaxed) > 0,
+        "caller should have sent bytes for the PTT frames"
+    );
+    assert!(
+        callee_stats.bytes_recv.load(Ordering::Relaxed) > 0,
+        "callee should have received bytes for the PTT frames"
     );
 
     drop(caller.audio_out_tx);

@@ -201,12 +201,35 @@ pub struct CallIo {
     pub audio_out: mpsc::Receiver<OpusFrame>,
     /// Outbound text messages to seal + send.
     pub msg_out: mpsc::Receiver<String>,
+    /// Local PTT transitions to signal to the peer: `true` = started talking
+    /// (emits `PTT_START`), `false` = stopped (emits `PTT_STOP`).
+    pub ptt_out: mpsc::Receiver<bool>,
     /// Inbound decoded-ready Opus frames (to decode + play).
     pub audio_in: mpsc::Sender<OpusFrame>,
     /// Inbound text messages received from the peer.
     pub msg_in: mpsc::Sender<String>,
+    /// Inbound call events surfaced to the UI (e.g. the remote PTT indicator).
+    pub events_in: mpsc::Sender<CallEvent>,
+    /// Shared byte counters updated by the send/recv loops, read by the UI.
+    pub stats: std::sync::Arc<CallStats>,
     /// Signalled by the user/UI to request a graceful hangup.
     pub hangup: mpsc::Receiver<()>,
+}
+
+/// Events the call core surfaces to the UI as they happen on the wire.
+#[derive(Debug, Clone, Copy)]
+pub enum CallEvent {
+    /// The peer started (`true`) or stopped (`false`) transmitting.
+    RemotePtt(bool),
+}
+
+/// Live byte counters for the call, shared between the loops and the UI.
+#[derive(Debug, Default)]
+pub struct CallStats {
+    /// Total bytes written to the wire (all frame types, incl. headers).
+    pub bytes_sent: std::sync::atomic::AtomicU64,
+    /// Total bytes read from the wire.
+    pub bytes_recv: std::sync::atomic::AtomicU64,
 }
 
 /// Drive a live, interactive call: bridge the cpal [`AudioEngine`] and the TUI
@@ -242,15 +265,21 @@ async fn run_interactive(
     // Channels into the call core.
     let (audio_out_tx, audio_out) = mpsc::channel::<OpusFrame>(64);
     let (msg_out_tx, msg_out) = mpsc::channel::<String>(8);
+    let (ptt_out_tx, ptt_out) = mpsc::channel::<bool>(8);
     let (audio_in_tx, mut audio_in_rx) = mpsc::channel::<OpusFrame>(64);
     let (msg_in_tx, mut msg_in_rx) = mpsc::channel::<String>(8);
+    let (events_in_tx, mut events_in_rx) = mpsc::channel::<CallEvent>(16);
     let (hangup_tx, hangup) = mpsc::channel::<()>(1);
+    let stats = std::sync::Arc::new(CallStats::default());
 
     let io = CallIo {
         audio_out,
         msg_out,
+        ptt_out,
         audio_in: audio_in_tx,
         msg_in: msg_in_tx,
+        events_in: events_in_tx,
+        stats: stats.clone(),
         hangup,
     };
 
@@ -280,6 +309,10 @@ async fn run_interactive(
     // Outbound capture pump task handle; present only while PTT is held.
     let mut capture_task: Option<tokio::task::JoinHandle<()>> = None;
 
+    // Periodic refresh of the live byte counters onto the call screen.
+    let mut stats_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // The interactive event loop. Ends when the user hangs up, the peer drops
     // (call task finishes), or the UI input stream closes.
     let outcome = loop {
@@ -305,6 +338,8 @@ async fn run_interactive(
                                     }));
                                     screen.local_ptt = true;
                                     ui.render(screen.clone());
+                                    // Tell the peer we started talking.
+                                    let _ = ptt_out_tx.send(true).await;
                                 }
                                 Err(e) => tracing::warn!(error = %e, "capture start failed"),
                             }
@@ -317,6 +352,8 @@ async fn run_interactive(
                         let _ = engine.lock().expect("engine lock").stop_capture();
                         screen.local_ptt = false;
                         ui.render(screen.clone());
+                        // Tell the peer we stopped.
+                        let _ = ptt_out_tx.send(false).await;
                     }
                     Some(UiEvent::SendText(text)) => {
                         // Sending ends compose mode; clear the input line.
@@ -358,6 +395,24 @@ async fn run_interactive(
                     if screen.messages.len() > 100 {
                         screen.messages.remove(0);
                     }
+                    ui.render(screen.clone());
+                }
+            }
+            ev = events_in_rx.recv() => {
+                if let Some(CallEvent::RemotePtt(on)) = ev {
+                    // Live remote talking indicator.
+                    screen.remote_ptt = on;
+                    ui.render(screen.clone());
+                }
+            }
+            _ = stats_tick.tick() => {
+                // Refresh the live byte counters a couple times a second.
+                use std::sync::atomic::Ordering;
+                let sent = stats.bytes_sent.load(Ordering::Relaxed);
+                let recv = stats.bytes_recv.load(Ordering::Relaxed);
+                if sent != screen.bytes_sent || recv != screen.bytes_recv {
+                    screen.bytes_sent = sent;
+                    screen.bytes_recv = recv;
                     ui.render(screen.clone());
                 }
             }
@@ -416,8 +471,11 @@ pub async fn run_call(
     let CallIo {
         audio_out,
         msg_out,
+        ptt_out,
         audio_in,
         msg_in,
+        events_in,
+        stats,
         hangup,
     } = io;
 
@@ -432,9 +490,13 @@ pub async fn run_call(
         recv_dir,
         audio_in,
         msg_in,
+        events_in,
+        stats.clone(),
         ctrl_tx.clone(),
     );
-    let send_fut = send_loop(writer, keys, send_dir, audio_out, msg_out, hangup, ctrl_rx);
+    let send_fut = send_loop(
+        writer, keys, send_dir, audio_out, msg_out, ptt_out, stats, hangup, ctrl_rx,
+    );
 
     // Whichever half finishes first decides the call outcome; the other is
     // dropped (its half of the stream closes, unblocking the peer).
@@ -452,17 +514,21 @@ enum ControlOut {
 
 /// Read frames, open them, and dispatch plaintext to the sinks. Returns
 /// `Ok(())` on a graceful peer close or HANGUP; an error on a protocol/IO fault.
+#[allow(clippy::too_many_arguments)]
 async fn recv_loop<R>(
     mut reader: R,
     keys: std::sync::Arc<CallKeys>,
     recv_dir: Direction,
     audio_in: mpsc::Sender<OpusFrame>,
     msg_in: mpsc::Sender<String>,
+    events_in: mpsc::Sender<CallEvent>,
+    stats: std::sync::Arc<CallStats>,
     ctrl_tx: mpsc::Sender<ControlOut>,
 ) -> Result<()>
 where
     R: futures::AsyncRead + Unpin,
 {
+    use std::sync::atomic::Ordering;
     loop {
         let frame = match proto::read_frame(&mut reader).await {
             Ok(f) => f,
@@ -471,6 +537,9 @@ where
             Err(Error::Io(_)) => return Ok(()),
             Err(e) => return Err(e),
         };
+        stats
+            .bytes_recv
+            .fetch_add(frame.wire_len() as u64, Ordering::Relaxed);
         match frame {
             Frame::Audio { seq, sealed } => {
                 let aad = [FrameTag::Audio as u8];
@@ -502,16 +571,54 @@ where
                     Err(e) => return Err(e),
                 }
             }
-            Frame::Ping { .. } => {
-                // Ask the send half to reply; ignore if it has gone away.
-                let _ = ctrl_tx.send(ControlOut::Pong).await;
+            // Control frames are sealed too: authenticate (open) each before
+            // acting, so an attacker without the PSK cannot inject a HANGUP to
+            // drop the call or spoof the remote PTT indicator (SPEC §5.3).
+            Frame::Ping { seq, sealed } => {
+                if keys
+                    .open(recv_dir, seq, &[FrameTag::Ping as u8], &sealed)
+                    .is_ok()
+                {
+                    let _ = ctrl_tx.send(ControlOut::Pong).await;
+                } else {
+                    tracing::debug!(seq, "dropping unauthentic/replayed PING");
+                }
             }
-            Frame::Hangup { .. } => return Ok(()),
-            Frame::Pong { .. }
-            | Frame::PttStart { .. }
-            | Frame::PttStop { .. }
-            | Frame::Cipher { .. } => {
-                // Acknowledged but not acted on in M1.
+            Frame::Hangup { seq, sealed } => {
+                if keys
+                    .open(recv_dir, seq, &[FrameTag::Hangup as u8], &sealed)
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                tracing::debug!(seq, "dropping unauthentic HANGUP (call continues)");
+            }
+            Frame::PttStart { seq, sealed } => {
+                if keys
+                    .open(recv_dir, seq, &[FrameTag::PttStart as u8], &sealed)
+                    .is_ok()
+                {
+                    let _ = events_in.send(CallEvent::RemotePtt(true)).await;
+                } else {
+                    tracing::debug!(seq, "dropping unauthentic/replayed PTT_START");
+                }
+            }
+            Frame::PttStop { seq, sealed } => {
+                if keys
+                    .open(recv_dir, seq, &[FrameTag::PttStop as u8], &sealed)
+                    .is_ok()
+                {
+                    let _ = events_in.send(CallEvent::RemotePtt(false)).await;
+                } else {
+                    tracing::debug!(seq, "dropping unauthentic/replayed PTT_STOP");
+                }
+            }
+            Frame::Pong { seq, sealed } => {
+                // Authenticate the keepalive ack; nothing else to do with it.
+                let _ = keys.open(recv_dir, seq, &[FrameTag::Pong as u8], &sealed);
+            }
+            Frame::Cipher { .. } => {
+                // Mid-call AEAD renegotiation is not yet acted on.
             }
             Frame::Hello(_) => {
                 return Err(Error::Proto("unexpected HELLO after handshake".into()));
@@ -522,12 +629,15 @@ where
 
 /// Seal and write outbound frames as they are produced. Returns `Ok(())` when
 /// the user requests hangup or the capture/msg sources close.
+#[allow(clippy::too_many_arguments)]
 async fn send_loop<W>(
     mut writer: W,
     keys: std::sync::Arc<CallKeys>,
     send_dir: Direction,
     mut audio_out: mpsc::Receiver<OpusFrame>,
     mut msg_out: mpsc::Receiver<String>,
+    mut ptt_out: mpsc::Receiver<bool>,
+    stats: std::sync::Arc<CallStats>,
     mut hangup: mpsc::Receiver<()>,
     mut ctrl_rx: mpsc::Receiver<ControlOut>,
 ) -> Result<()>
@@ -535,13 +645,17 @@ where
     W: futures::AsyncWrite + Unpin,
 {
     let mut send_seq: u64 = 0;
+    // Stops polling the PTT channel once the UI side closes it, so a closed
+    // channel doesn't spin the select with immediate `None`s.
+    let mut ptt_open = true;
     loop {
         tokio::select! {
             biased;
 
             _ = hangup.recv() => {
-                let sealed = keys.seal(send_dir, next(&mut send_seq), &[FrameTag::Hangup as u8], &[]);
-                let _ = proto::write_frame(&mut writer, &Frame::Hangup { sealed }).await;
+                let seq = next(&mut send_seq);
+                let sealed = keys.seal(send_dir, seq, &[FrameTag::Hangup as u8], &[]);
+                let _ = write_counted(&mut writer, &stats, Frame::Hangup { seq, sealed }).await;
                 return Ok(());
             }
 
@@ -549,13 +663,13 @@ where
                 match maybe {
                     Some(frame) => {
                         let seq = next(&mut send_seq);
-                        let aad = [FrameTag::Audio as u8];
-                        let sealed = keys.seal(send_dir, seq, &aad, &frame.data);
-                        proto::write_frame(&mut writer, &Frame::Audio { seq, sealed }).await?;
+                        let sealed = keys.seal(send_dir, seq, &[FrameTag::Audio as u8], &frame.data);
+                        write_counted(&mut writer, &stats, Frame::Audio { seq, sealed }).await?;
                     }
                     None => {
-                        let sealed = keys.seal(send_dir, next(&mut send_seq), &[FrameTag::Hangup as u8], &[]);
-                        let _ = proto::write_frame(&mut writer, &Frame::Hangup { sealed }).await;
+                        let seq = next(&mut send_seq);
+                        let sealed = keys.seal(send_dir, seq, &[FrameTag::Hangup as u8], &[]);
+                        let _ = write_counted(&mut writer, &stats, Frame::Hangup { seq, sealed }).await;
                         return Ok(());
                     }
                 }
@@ -568,20 +682,52 @@ where
                     // real `Frame::Msg` field carried on the wire (proto encodes
                     // it as an 8-byte prefix, exactly like AUDIO).
                     let seq = next(&mut send_seq);
-                    let aad = [FrameTag::Msg as u8];
-                    let sealed = keys.seal(send_dir, seq, &aad, text.as_bytes());
-                    proto::write_frame(&mut writer, &Frame::Msg { seq, sealed }).await?;
+                    let sealed = keys.seal(send_dir, seq, &[FrameTag::Msg as u8], text.as_bytes());
+                    write_counted(&mut writer, &stats, Frame::Msg { seq, sealed }).await?;
+                }
+            }
+
+            maybe = ptt_out.recv(), if ptt_open => {
+                match maybe {
+                    // `true` = started talking, `false` = stopped. Sealed (empty
+                    // body) so the peer authenticates the indicator transition.
+                    Some(talking) => {
+                        let seq = next(&mut send_seq);
+                        let frame = if talking {
+                            let sealed = keys.seal(send_dir, seq, &[FrameTag::PttStart as u8], &[]);
+                            Frame::PttStart { seq, sealed }
+                        } else {
+                            let sealed = keys.seal(send_dir, seq, &[FrameTag::PttStop as u8], &[]);
+                            Frame::PttStop { seq, sealed }
+                        };
+                        write_counted(&mut writer, &stats, frame).await?;
+                    }
+                    None => ptt_open = false,
                 }
             }
 
             maybe = ctrl_rx.recv() => {
                 if let Some(ControlOut::Pong) = maybe {
-                    let sealed = keys.seal(send_dir, next(&mut send_seq), &[FrameTag::Pong as u8], &[]);
-                    proto::write_frame(&mut writer, &Frame::Pong { sealed }).await?;
+                    let seq = next(&mut send_seq);
+                    let sealed = keys.seal(send_dir, seq, &[FrameTag::Pong as u8], &[]);
+                    write_counted(&mut writer, &stats, Frame::Pong { seq, sealed }).await?;
                 }
             }
         }
     }
+}
+
+/// Write a frame and credit its wire size to `bytes_sent`.
+async fn write_counted<W>(writer: &mut W, stats: &CallStats, frame: Frame) -> Result<()>
+where
+    W: futures::AsyncWrite + Unpin,
+{
+    proto::write_frame(writer, &frame).await?;
+    stats.bytes_sent.fetch_add(
+        frame.wire_len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(())
 }
 
 /// Frame-type tag bound into the AEAD AAD so a frame sealed as one type cannot be
@@ -591,6 +737,9 @@ where
 enum FrameTag {
     Audio = 0x02,
     Msg = 0x03,
+    PttStart = 0x04,
+    PttStop = 0x05,
+    Ping = 0x06,
     Pong = 0x07,
     Hangup = 0x08,
 }

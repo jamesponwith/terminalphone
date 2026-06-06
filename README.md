@@ -80,8 +80,9 @@ issue status is authoritative in beads (`bd ready`).
 | **M5** | Android/Termux audio, pluggable-transport bridges, signed reproducible builds | ⏳ planned |
 
 **Working today:** hosting and dialing a real onion service over embedded Tor, a
-clear two-way push-to-talk call with authenticated per-call encryption, in-call
-encrypted text, the gated single-hop-service warning, passphrase-protected
+clear two-way push-to-talk call with authenticated per-call encryption, a live
+remote-talking indicator + byte stats, in-call encrypted text, authenticated
+control frames, the gated single-hop-service warning, passphrase-protected
 secret-at-rest (Argon2id), a voice changer, QR identity sharing, and a headless
 self-test that exercises the whole encode → seal → wire → open → decode pipeline
 without a microphone or a Tor circuit.
@@ -280,6 +281,12 @@ connection cannot be attributed to either party by a network observer.
 **No silent failures.** The AEAD suite is exchanged in `HELLO`; a mismatch — or a
 PSK mismatch — aborts the call with an explicit error rather than connecting
 silently.
+
+**Authenticated control frames.** Every post-handshake frame — including control
+frames like `HANGUP`, `PTT_START`/`PTT_STOP`, and `PING`/`PONG` — carries a
+sequence number and is AEAD-sealed and replay-checked. An on-path attacker
+without the PSK cannot inject a `HANGUP` to drop the call or spoof the remote
+talking indicator; forged or replayed control frames are dropped silently.
 
 **Secret at rest.** The PSK can be encrypted on disk with a passphrase
 (`TERMINALPHONE_PASSPHRASE`): the key is wrapped with **AES-256-GCM** under an
